@@ -174,7 +174,7 @@ def moe_align_block_size_stage3_v2(
     )
 
     block_buf = tl.zeros([1, aligned_num_experts,], dtype=tl.int32)
-    
+
     # loop body
     for i in tl.range(start_idx, end_idx - tokens_per_block, tokens_per_block, num_stages=stages):
         tokens_cnts = tl.load(tokens_cnts_block_ptr)
@@ -185,17 +185,20 @@ def moe_align_block_size_stage3_v2(
         tokens_cnts_block_ptr = tl.advance(tokens_cnts_block_ptr, (tokens_per_block, 0))
 
     # loop tail
-    if tokens_per_block == 1 or end_idx % tokens_per_block != 0:
+    if end_idx - tokens_per_block <= start_idx:
+        off_r = tl.arange(0, tokens_per_block)[:, None] 
+    else:
         off_r = tl.arange(0, tokens_per_block)[:, None] + i + tokens_per_block
-        off_c = tl.arange(0, aligned_num_experts)[None, :]
 
-        mask_r = off_r < end_idx
-        mask_c = off_c >= 0
+    off_c = tl.arange(0, aligned_num_experts)[None, :]
 
-        tokens_cnts = tl.load(tokens_cnts_ptr + off_r * aligned_num_experts + off_c, mask=mask_r + mask_c)
+    mask_r = off_r < end_idx
+    mask_c = off_c >= 0
 
-        tokens_cnts_sum = tl.sum(tokens_cnts, 0, keep_dims=True)
-        block_buf = block_buf + tokens_cnts_sum
+    tokens_cnts = tl.load(tokens_cnts_ptr + off_r * aligned_num_experts + off_c, mask=mask_r + mask_c)
+
+    tokens_cnts_sum = tl.sum(tokens_cnts, 0, keep_dims=True)
+    block_buf = block_buf + tokens_cnts_sum
 
     # NOTE(yiakwy) : no block synchronizaiton barrier available in triton (triton-3.2.0+gite1697f6b)
     tl.atomic_add(occurrencies_per_expert_ptr + tl.arange(0, aligned_num_experts)[None, :], block_buf)
@@ -541,7 +544,7 @@ def moe_align_block_size_triton_v2(
 
         # TODO (yiakwy) : move this pre-allocation out of triton op
         # occurrencies_per_expert_buf = torch.zeros((aligned_num_blocks, aligned_num_experts), dtype=torch.int32, device=topk_ids.device)
-
+        
         this_grid = (num_blocks,)
         moe_align_block_size_stage3_v2[this_grid](
             tokens_cnts, # input
@@ -907,6 +910,6 @@ if __name__ == "__main__":
     #             print("seq : ", 2**j)
 
     #             exit(-1)
-    # calculate_diff(batch_size=10, seq_len=3)
+    # calculate_diff(batch_size=32, seq_len=3) # set tokens_per_block to 1 if encounter error
 
     benchmark.run(print_data=True, save_path=args.save_path)
