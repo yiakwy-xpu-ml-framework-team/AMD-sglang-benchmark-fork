@@ -116,7 +116,13 @@ def moe_align_block_size_triton(
         numel,
         tokens_per_thread,
     )
-    print("[stage1] tokens_cnts : ", tokens_cnts)
+    torch.set_printoptions(profile="full")
+    print("[stage1] tokens_cnts : ", tokens_cnts.sum(axis=0, keepdim=True))
+    print(
+        "[stage1] unaligned_cumsum : ",
+        tokens_cnts.sum(axis=0, keepdim=True).cumsum(axis=1),
+    )
+    torch.set_printoptions(profile="default")
     moe_align_block_size_stage2[grid](
         tokens_cnts,
         num_experts,
@@ -143,7 +149,7 @@ def moe_align_block_size_triton(
 
 
 def calculate_diff(batch_size, seq_len):
-    num_experts = 8  # 256
+    num_experts = 32
     block_size = 3  # 128
     topk = 4  # 8
 
@@ -162,13 +168,13 @@ def calculate_diff(batch_size, seq_len):
     )
     sorted_ids_cuda.fill_(topk_ids.numel())
     max_num_m_blocks = max_num_tokens_padded // block_size
-    expert_ids_cuda = torch.empty(
+    expert_ids_cuda = torch.zeros(
         (max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device
     )
     num_tokens_post_pad_cuda = torch.empty(
         (1), dtype=torch.int32, device=topk_ids.device
     )
-    token_cnts_buffer = torch.empty(
+    token_cnts_buffer = torch.zeros(
         (num_experts + 1) * num_experts, dtype=torch.int32, device=topk_ids.device
     )
     cumsum_buffer = torch.empty(
@@ -177,7 +183,7 @@ def calculate_diff(batch_size, seq_len):
 
     sorted_ids_triton = torch.empty_like(sorted_ids_cuda)
     sorted_ids_triton.fill_(topk_ids.numel())
-    expert_ids_triton = torch.empty_like(expert_ids_cuda)
+    expert_ids_triton = torch.zeros_like(expert_ids_cuda)
     num_tokens_post_pad_triton = torch.empty_like(num_tokens_post_pad_cuda)
 
     # compare the performance of cuda and triton implementation
@@ -264,14 +270,14 @@ def benchmark(batch_size, seq_len, provider):
     )
     sorted_ids.fill_(topk_ids.numel())
     max_num_m_blocks = max_num_tokens_padded // block_size
-    expert_ids = torch.empty(
+    expert_ids = torch.zeros(
         (max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device
     )
     num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
     token_cnts_buffer = torch.empty(
         (num_experts + 1) * num_experts, dtype=torch.int32, device=topk_ids.device
     )
-    cumsum_buffer = torch.empty(
+    cumsum_buffer = torch.emtpy(
         num_experts + 1, dtype=torch.int32, device=topk_ids.device
     )
 
@@ -322,7 +328,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # calculate_diff(batch_size=5, seq_len=1)
-    calculate_diff(batch_size=4, seq_len=1024)
+    calculate_diff(batch_size=8, seq_len=1)
+    # calculate_diff(batch_size=4, seq_len=1024)
+
     # calculate_diff(batch_size=1, seq_len=16384)
 
     # benchmark.run(print_data=True, save_path=args.save_path)

@@ -31,8 +31,8 @@
   // NOTE(yiakwy) : func alias
   template <typename... Args>
   static __inline__ __host__ __device__
-  auto cudaLaunchCooperativeKernel(Args&&... args) -> decltype(cudaLaunchCooperativeKernel(std::forward<Args>(args)...)) {
-    return cudaLaunchCooperativeKernel(std::forward<Args>(args)...);
+  auto cudaLaunchCooperativeKernel(Args&&... args) -> decltype(hipLaunchCooperativeKernel(std::forward<Args>(args)...)) {
+    return hipLaunchCooperativeKernel(std::forward<Args>(args)...);
   }
 #endif
 
@@ -54,7 +54,13 @@ __device__ __forceinline__ int32_t index(int32_t total_col, int32_t row, int32_t
   return row * total_col + col;
 }
 
-#define OFFSETS_PAD 1
+#define FRAGS_PER_BLOCK  4
+#define BLOCK_SIZE_M    16
+#define BLOCK_SIZE_N    16
+#define MAX_NUM_EXPERTS 256
+#define SHIFT_1_PAD     1
+
+namespace cg = cooperative_groups;
 
 template <typename scalar_t>
 __global__ void moe_align_block_size_kernel(scalar_t* __restrict__ topk_ids, int32_t* sorted_token_ids,
@@ -62,7 +68,7 @@ __global__ void moe_align_block_size_kernel(scalar_t* __restrict__ topk_ids, int
                                             int32_t block_size, size_t numel, int32_t* cumsum) {
   __shared__ int32_t shared_counts[32][8];
   // NOTE (yiakwy) : this assumes num_experts <= 256
-  __shared__ int32_t local_offsets[256+OFFSETS_PAD];
+  __shared__ int32_t local_offsets[256+SHIFT_1_PAD];
   __shared__ int32_t local_offsets_buf[16];
 
   const int tid = threadIdx.x;
@@ -225,9 +231,12 @@ template <typename scalar_t>
 __global__ void moe_align_block_size_multiblocks_kernel(scalar_t* __restrict__ topk_ids, int32_t* sorted_token_ids,
                                             int32_t* expert_ids, int32_t* total_tokens_post_pad, int32_t num_experts,
                                             int32_t block_size, size_t numel, int32_t* tokens_cnts, int32_t* cumsum, const int tokens_per_block, const int tokens_per_thread, const int K) {
-  __shared__ int32_t shared_counts[32][8];
-  // NOTE (yiakwy) : this assumes num_experts <= 256
-  __shared__ int32_t local_offsets[256+OFFSETS_PAD];
+  // NOTE (yiakwy) : for 16x16 fragment, the maximum of 16 fragments be used in a single block to process MAX_NUM_EXPERTS (256) experts
+  __shared__ int32_t smem[ BLOCK_SIZE_M * BLOCK_SIZE_N * FRAGS_PER_BLOCK ];
+  int32_t (*shared_counts)[8] = (int32_t (*)[8])&smem[0];
+  // NOTE (yiakwy) : this assumes num_experts <= MAX_NUM_EXPERTS (256)
+  __shared__ int32_t local_offsets[ MAX_NUM_EXPERTS + SHIFT_1_PAD];
+  // NOTE (yiakwy) : lcoal buf for parallel cumsum
   __shared__ int32_t local_offsets_buf[16];
 
   const int tid = threadIdx.x + blockDim.x * blockIdx.x;
@@ -237,15 +246,18 @@ __global__ void moe_align_block_size_multiblocks_kernel(scalar_t* __restrict__ t
   const int experts_per_warp = 8;
 
   // NOTE (yiakwy) : used to synchronize blocks,
-  cooperative_groups::grid_group grid = cooperative_groups::this_grid();
+  cg::grid_group grid = cg::this_grid();
 
   // NOTE (yiakwy) : not all threads participate in
   const size_t start_idx = tokens_per_block * blockIdx.x + tokens_per_thread * threadIdx.x;
   const size_t end_idx = start_idx + tokens_per_thread;
 
   int *shared_counts_base = &(shared_counts[0][0]);
-  if (threadIdx.x < 256) {
-    *(shared_counts_base + threadIdx.x) = 0;
+
+  if (threadIdx.x < BLOCK_SIZE_M * BLOCK_SIZE_N) {
+    for (int i=0; i < BLOCK_SIZE_M * BLOCK_SIZE_N * FRAGS_PER_BLOCK ; i+=BLOCK_SIZE_M * BLOCK_SIZE_N) {
+      *(shared_counts_base + threadIdx.x + i) = 0;
+    }
   }
 
   // NOTE (yiakwy) : this warp of threads may access other warp of threads based on the value of expert id fetched
@@ -339,12 +351,12 @@ __global__ void moe_align_block_size_multiblocks_kernel(scalar_t* __restrict__ t
 
   __syncthreads();
 
-#ifdef DEBUG
+// #ifdef DEBUG
   if (threadIdx.x == 0) {
     printf("[Block#%d] local_offsets[1:num_experts+1] = [%d, %d, ..., %d, %d]\n", blockIdx.x, local_offsets[1], local_offsets[2], local_offsets[num_experts-1], local_offsets[num_experts]);
   }
   __syncthreads();
-#endif
+// #endif
 
   {
     if (tid < num_experts) {
@@ -359,49 +371,63 @@ __global__ void moe_align_block_size_multiblocks_kernel(scalar_t* __restrict__ t
     __threadfence_system();
     grid.sync();
 
-#define BLOCK_SIZE_M      16
-#define BLOCK_SIZE_N      16
-
 #define kElementsPerAccess 4
 #define kWarpsToLoad       2
 
-    int total_fragments = CEILDIV(num_experts, BLOCK_SIZE_N);
+    int total_fragments     = CEILDIV(num_experts, BLOCK_SIZE_N);
     int fragments_per_block = CEILDIV(total_fragments, gridDim.x);
+    int fragments_per_warp  = CEILDIV(fragments_per_block, FRAGS_PER_BLOCK);
+
+    if (tid == 0) {
+      printf("[tid#0] fragments : %d, fragments/block : %d\n", total_fragments, fragments_per_block);
+    }
 
     if (blockIdx.x * fragments_per_block < total_fragments) {
       int *tokens_cnts_ptr = &(tokens_cnts[0]);
 
       for (int i=0; i < gridDim.x; i += BLOCK_SIZE_M) {
-        if (warp_id < kWarpsToLoad * fragments_per_block) { // NOTE (yiakwy) : kWarpsToLoad warps (CUDA) for loading 16x16 fragment
-          const int kNumThrPerRow = WARP_SIZE / BLOCK_SIZE_N;
-          int sRow = lane_id / kNumThrPerRow ; // sRow=7, lane_id=14
-          int sCol = lane_id % kNumThrPerRow * kElementsPerAccess + warp_id * (kNumThrPerRow * kElementsPerAccess);
+        for ( int j=0; j < fragments_per_warp; j++) {
 
-          int gRow = i * BLOCK_SIZE_M + sRow;
-          int gCol = blockIdx.x * fragments_per_block * BLOCK_SIZE_N + sCol;
+          if (warp_id * fragments_per_warp < kWarpsToLoad * fragments_per_block) { // NOTE (yiakwy) : kWarpsToLoad warps (CUDA) for loading 16x16 fragment
+            const int kNumThrPerRow = WARP_SIZE / BLOCK_SIZE_N;
+            int sRow = lane_id / kNumThrPerRow ;
+            int sColOff = kNumThrPerRow * kElementsPerAccess;
+            int sCol = lane_id % kNumThrPerRow * kElementsPerAccess + warp_id * sColOff;
 
-          if (gRow < num_experts && gCol < num_experts) { // NOTE (yiakwy) : defensive guard
-            // NOTE (yiakwy) : useful to coalesce memory transaction when loading a column of data
-            int4 *tokens_cnts_4i_ptr = (int4 *)(tokens_cnts_ptr + (gRow+1) * num_experts + gCol);
-            int4 *shared_counts_4i_ptr = (int4 *)(shared_counts_base + sRow * BLOCK_SIZE_N + sCol);
+            int gRow = i * BLOCK_SIZE_M + sRow;
+            int gCol = blockIdx.x * fragments_per_block * BLOCK_SIZE_N + lane_id % kNumThrPerRow * kElementsPerAccess + (warp_id * fragments_per_warp + j) * sColOff;
 
-            *shared_counts_4i_ptr = *tokens_cnts_4i_ptr;
-          }
-        }
-        __syncthreads();
+            if (gRow < num_experts && gCol < num_experts) { // NOTE (yiakwy) : defensive guard
+              // NOTE (yiakwy) : useful to coalesce memory transaction when loading a column of data
+              int4 *tokens_cnts_4i_ptr = (int4 *)(tokens_cnts_ptr + (gRow+1) * num_experts + gCol);
+              int4 *shared_counts_4i_ptr = (int4 *)(shared_counts_base + sRow * fragments_per_block * BLOCK_SIZE_N + sCol);
 
-        if (warp_id < kWarpsToLoad * fragments_per_block && warp_id % kWarpsToLoad == 0) { // NOTE (yiakwy) : 1 warp (CUDA) for processing 16x16 fragment
-          for (int k=0; k < BLOCK_SIZE_N; k+=2) { // NOTE (yiakwy) : this simple arangement enables thread 0 accessing addresses limited to bank 0, thread 16 accesses limited to bank 16, etc in CUDA.
-            int sRow = lane_id / BLOCK_SIZE_N + k;
-            int sCol = lane_id % BLOCK_SIZE_N;
-
-            int gCol = blockIdx.x * fragments_per_block * BLOCK_SIZE_N + sCol;
-            if (gCol < num_experts) { // NOTE (yiakwy) : defensive guard
-              atomicAdd(tokens_cnts_ptr + gCol, *(shared_counts_base + sRow * BLOCK_SIZE_N + sCol));
+              *shared_counts_4i_ptr = *tokens_cnts_4i_ptr;
             }
           }
+          __syncthreads();
+
+          if ( (warp_id * fragments_per_warp < kWarpsToLoad * fragments_per_block ) &&
+               (warp_id % kWarpsToLoad == 0) ) { // NOTE (yiakwy) : 1 warp (CUDA) for processing 16x16 fragment
+            for (int k=0; k < BLOCK_SIZE_N; k+=2) { // NOTE (yiakwy) : this simple arangement enables thread 0 accessing addresses limited to bank 0, thread 16 accesses limited to bank 16, etc in CUDA.
+              int sRow = lane_id / BLOCK_SIZE_N + k;
+              int sCol = lane_id % BLOCK_SIZE_N + (warp_id / kWarpsToLoad) * BLOCK_SIZE_N;
+
+              int gCol = blockIdx.x * fragments_per_block * BLOCK_SIZE_N + lane_id % BLOCK_SIZE_N + (warp_id / kWarpsToLoad * fragments_per_warp + j) * BLOCK_SIZE_N;
+              if (gCol < num_experts) { // NOTE (yiakwy) : defensive guard
+                // if ( (lane_id == 0 || lane_id == 16) ) {
+                // printf("[tid#%d][k#%d] tokens_cnts_ptr[0][%d] (%d) += s[%d][%d] (%d) = %d\n", tid, k, gCol, *(tokens_cnts_ptr + gCol), sRow, sCol, *(shared_counts_base + sRow * BLOCK_SIZE_N + sCol), *(tokens_cnts_ptr + gCol) + *(shared_counts_base + sRow * BLOCK_SIZE_N + sCol));
+                // }
+                atomicAdd(tokens_cnts_ptr + gCol, *(shared_counts_base + sRow * fragments_per_block * BLOCK_SIZE_N + sCol));
+                // if (lane_id == 0 || lane_id == 16) {
+                // printf("[tid#%d][k#%d] tokens_cnts_ptr[0][%d] = %d\n", tid, k, gCol, *(tokens_cnts_ptr + gCol));
+                // }
+              }
+            }
+          }
+          __syncthreads();
+
         }
-        __syncthreads();
 
       }
     }
@@ -414,12 +440,12 @@ __global__ void moe_align_block_size_multiblocks_kernel(scalar_t* __restrict__ t
     }
      __syncthreads();
 
-#ifdef DEBUG
+// #ifdef DEBUG
     if (tid == 0) {
       printf("[Block#%d] unaligned global offsets[1:num_experts+1] = [%d, %d, ..., %d, %d]\n", blockIdx.x, local_offsets[1], local_offsets[2], local_offsets[num_experts-1], local_offsets[num_experts]);
     }
     __syncthreads();
-#endif
+// #endif
 
   } // code block of computing global cumsum
 
@@ -437,12 +463,12 @@ __global__ void moe_align_block_size_multiblocks_kernel(scalar_t* __restrict__ t
   }
   __syncthreads();
 
-#ifdef DEBUG
+// #ifdef DEBUG
   if (tid == 0) {
     printf("[Block#%d] aligned global offsets[1:num_experts+1] = [%d, %d, ..., %d, %d]\n", blockIdx.x, local_offsets[1], local_offsets[2], local_offsets[num_experts-1], local_offsets[num_experts]);
   }
   __syncthreads();
-#endif
+// #endif
 
 #define kElementsPerThr    16
 #define kElementsPerAccess 4
@@ -523,7 +549,7 @@ void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts, int64_t b
       kernel<<<1, 1024, 0, stream>>>(topk_ids.data_ptr<scalar_t>(), sorted_token_ids.data_ptr<int32_t>(),
                                     experts_ids.data_ptr<int32_t>(), num_tokens_post_pad.data_ptr<int32_t>(),
                                     num_experts, block_size, topk_ids.numel(), cumsum_buffer.data_ptr<int32_t>());
-      // printf("%d blocks used.\n", 1);
+      printf("%d blocks used.\n", 1);
     } else {
       auto kernel = moe_align_block_size_multiblocks_kernel<scalar_t>;
 // NOTE (yiakwy) : reduce registers consumed
@@ -533,7 +559,7 @@ void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts, int64_t b
       int32_t tokens_per_block = CEILDIV(topk_ids.sizes()[0], BLOCKS) * topk_ids.sizes()[1];
       int32_t tokens_per_thread = CEILDIV(tokens_per_block, BLOCK_SIZE);
 
-      // printf("%d BLOCKS used. %d tokens per block. %d tokens per thread\n", BLOCKS, tokens_per_block, tokens_per_thread);
+      printf("%d BLOCKS used. %d tokens per block. %d tokens per thread\n", BLOCKS, tokens_per_block, tokens_per_thread);
       /*
       kernel<<<BLOCKS, BLOCK_SIZE, 0, stream>>>(topk_ids.data_ptr<scalar_t>(), sorted_token_ids.data_ptr<int32_t>(),
                                     experts_ids.data_ptr<int32_t>(), num_tokens_post_pad.data_ptr<int32_t>(),
