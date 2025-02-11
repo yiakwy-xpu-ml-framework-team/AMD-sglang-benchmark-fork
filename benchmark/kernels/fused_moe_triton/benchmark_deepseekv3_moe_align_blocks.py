@@ -149,9 +149,9 @@ def moe_align_block_size_triton(
 
 
 def calculate_diff(batch_size, seq_len):
-    num_experts = 32
+    num_experts = 256
     block_size = 3  # 128
-    topk = 4  # 8
+    topk = 8
 
     topk_ids = torch.stack(
         [
@@ -210,19 +210,25 @@ def calculate_diff(batch_size, seq_len):
         num_tokens_post_pad_cuda, num_tokens_post_pad_triton
     ):
         print("✅ CUDA and Triton implementations match")
+        print("CUDA cumsum : ", cumsum_buffer)
+        print("CUDA sorted ids:", sorted_ids_cuda)
+        print("Triton sorted ids:", sorted_ids_triton)
     else:
         print("❌ CUDA and Triton implementations do not match")
         print("CUDA cumsum : ", cumsum_buffer)
         print("CUDA sorted ids:", sorted_ids_cuda)
         print("Triton sorted ids:", sorted_ids_triton)
+        torch.set_printoptions(profile="full")
         print("CUDA expert_ids:", expert_ids_cuda)
         print("Triton expert_ids:", expert_ids_triton)
+        torch.set_printoptions(profile="default")
         print("CUDA num_tokens_post_pad:", num_tokens_post_pad_cuda)
         print("Triton num_tokens_post_pad:", num_tokens_post_pad_triton)
 
 
 batch_size_range = [2**i for i in range(0, 8)]
 seq_length_range = [2**i for i in range(14, 16)]
+# expert_ids_range = [2**i for i in range(3, 8)]
 configs = list(itertools.product(batch_size_range, seq_length_range))
 
 
@@ -274,7 +280,7 @@ def benchmark(batch_size, seq_len, provider):
         (max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device
     )
     num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
-    token_cnts_buffer = torch.empty(
+    token_cnts_buffer = torch.zeros(
         (num_experts + 1) * num_experts, dtype=torch.int32, device=topk_ids.device
     )
     cumsum_buffer = torch.emtpy(
@@ -327,10 +333,13 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
+    # calculate_diff(batch_size=1, seq_len=1)
     # calculate_diff(batch_size=5, seq_len=1)
-    calculate_diff(batch_size=8, seq_len=1)
+    # calculate_diff(batch_size=8, seq_len=1)
+    # calculate_diff(batch_size=32, seq_len=1)
     # calculate_diff(batch_size=4, seq_len=1024)
 
-    # calculate_diff(batch_size=1, seq_len=16384)
+    # calculate_diff(batch_size=1, seq_len=16)
+    calculate_diff(batch_size=1, seq_len=16384 // 8)
 
     # benchmark.run(print_data=True, save_path=args.save_path)

@@ -33,10 +33,10 @@ nvcc_flags = [
     "-O3",
     "-Xcompiler",
     "-fPIC",
-    "-gencode=arch=compute_75,code=sm_75",
+    # "-gencode=arch=compute_75,code=sm_75",
     "-gencode=arch=compute_80,code=sm_80",
-    "-gencode=arch=compute_89,code=sm_89",
-    "-gencode=arch=compute_90,code=sm_90",
+    # "-gencode=arch=compute_89,code=sm_89",
+    # "-gencode=arch=compute_90,code=sm_90",
     "-U__CUDA_NO_HALF_OPERATORS__",
     "-U__CUDA_NO_HALF2_OPERATORS__",
 ]
@@ -71,7 +71,7 @@ setup(
     package_dir={"": "src"},
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},
-    install_requires=["torch"],
+    install_requires=["torch<=2.5.1"],
 )
 
 update_wheel_platform_tag()
