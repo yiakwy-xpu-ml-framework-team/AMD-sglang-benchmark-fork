@@ -60,7 +60,7 @@ __device__ __forceinline__ int32_t index(int32_t total_col, int32_t row, int32_t
 #define MAX_NUM_EXPERTS 256
 #define SHIFT_1_PAD     1
 
-#define USE_CUSUM_LOCAL_CACHE true
+#define USE_CUSUM_LOCAL_CACHE false
 
 namespace cg = cooperative_groups;
 
@@ -310,7 +310,6 @@ __global__ void moe_align_block_size_multiblocks_kernel(scalar_t* __restrict__ t
         int expert_count = shared_counts[warp_idx][expert_offset];
 
         int last_val = (i-1) % kElementsPerThr == 0 ? 0 : local_offsets[i-1];
-        // local_offsets[i] = last_val + CEILDIV(expert_count, block_size) * block_size;
         local_offsets[i] = last_val + expert_count;
       }
 
@@ -483,9 +482,9 @@ __global__ void moe_align_block_size_multiblocks_kernel(scalar_t* __restrict__ t
       // NOTE(yiakwy) : loop body useful for workload with the number of experts upto 256
       for (int i=tid * kElementsPerThr ; i < (tid + 1) * kElementsPerThr; i += kElementsPerAccess) {
         *(int4 *)(cumsum + i) = *(int4 *)(local_offsets + i);
-// #ifdef DEBUG
+#ifdef DEBUG
         *(int4 *)(tokens_cnts + i) = *(int4 *)(local_offsets + i);
-// #endif
+#endif
       }
 
       // printf("[tid#%d] cumsum[%d] (%d) = local_offsets[%d] (%d %d %d %d ...)\n", tid, tid * kElementsPerThr, cumsum[tid * kElementsPerThr], tid * kElementsPerThr, local_offsets[tid * kElementsPerThr], local_offsets[tid * kElementsPerThr+1], local_offsets[tid * kElementsPerThr+2], local_offsets[tid * kElementsPerThr+3]);
@@ -496,9 +495,9 @@ __global__ void moe_align_block_size_multiblocks_kernel(scalar_t* __restrict__ t
       #pragma unroll
       for (int i=tid * kElementsPerThr; i < num_experts+1; i++) {
         *(cumsum + i) = *(local_offsets + i);
-// #ifdef DEBUG
+#ifdef DEBUG
         *(tokens_cnts + i) = *(local_offsets + i);
-// #endif
+#endif
       }
     }
 
@@ -572,7 +571,6 @@ void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts, int64_t b
       kernel<<<1, 1024, 0, stream>>>(topk_ids.data_ptr<scalar_t>(), sorted_token_ids.data_ptr<int32_t>(),
                                     experts_ids.data_ptr<int32_t>(), num_tokens_post_pad.data_ptr<int32_t>(),
                                     num_experts, block_size, topk_ids.numel(), cumsum_buffer.data_ptr<int32_t>());
-      // printf("%d blocks used.\n", 1);
     } else {
       auto kernel = moe_align_block_size_multiblocks_kernel<scalar_t>;
 // NOTE (yiakwy) : reduce registers consumed
@@ -581,8 +579,6 @@ void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts, int64_t b
 
       int32_t tokens_per_block = CEILDIV(topk_ids.sizes()[0], BLOCKS) * topk_ids.sizes()[1];
       int32_t tokens_per_thread = CEILDIV(tokens_per_block, BLOCK_SIZE);
-
-      // printf("%d BLOCKS used. %d tokens per block. %d tokens per thread\n", BLOCKS, tokens_per_block, tokens_per_thread);
 
       // NOTE (yiakwy) : remove const decorator for kernel args
       scalar_t* topk_ids_ptr = topk_ids.data_ptr<scalar_t>();
