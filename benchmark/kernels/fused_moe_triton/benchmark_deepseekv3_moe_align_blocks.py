@@ -116,13 +116,7 @@ def moe_align_block_size_triton(
         numel,
         tokens_per_thread,
     )
-    torch.set_printoptions(profile="full")
-    print("[stage1] tokens_cnts : ", tokens_cnts.sum(axis=0, keepdim=True))
-    print(
-        "[stage1] unaligned_cumsum : ",
-        tokens_cnts.sum(axis=0, keepdim=True).cumsum(axis=1),
-    )
-    torch.set_printoptions(profile="default")
+
     moe_align_block_size_stage2[grid](
         tokens_cnts,
         num_experts,
@@ -134,7 +128,7 @@ def moe_align_block_size_triton(
         num_experts,
         block_size,
     )
-    print("[stage3] cumsum : ", cumsum)
+
     moe_align_block_size_stage4[grid](
         topk_ids,
         sorted_token_ids,
@@ -148,10 +142,17 @@ def moe_align_block_size_triton(
     )
 
 
-def calculate_diff(batch_size, seq_len):
-    num_experts = 256
-    block_size = 3  # 128
+def calculate_diff(batch_size, seq_len, num_experts):
+    num_experts = num_experts
+    block_size = 128
     topk = 8
+
+    assert batch_size > 0
+    assert seq_len > 0
+    assert num_experts >= 4
+
+    if topk > num_experts:
+        topk = num_experts
 
     topk_ids = torch.stack(
         [
@@ -159,8 +160,6 @@ def calculate_diff(batch_size, seq_len):
             for _ in range(batch_size * seq_len)
         ]
     )
-
-    print("topk_ids : ", topk_ids)
 
     max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
     sorted_ids_cuda = torch.empty(
@@ -206,29 +205,34 @@ def calculate_diff(batch_size, seq_len):
         num_tokens_post_pad_triton,
     )
 
-    if torch.allclose(expert_ids_cuda, expert_ids_triton) and torch.allclose(
-        num_tokens_post_pad_cuda, num_tokens_post_pad_triton
+    sorted_ids_cuda_snapshot = sorted_ids_cuda[: cumsum_buffer[1]].sort().values
+    sorted_ids_triton_snapshot = sorted_ids_triton[: cumsum_buffer[1]].sort().values
+
+    if (
+        torch.allclose(expert_ids_cuda, expert_ids_triton)
+        and torch.allclose(num_tokens_post_pad_cuda, num_tokens_post_pad_triton)
+        and torch.allclose(sorted_ids_cuda_snapshot, sorted_ids_triton_snapshot)
     ):
-        print("✅ CUDA and Triton implementations match")
-        print("CUDA cumsum : ", cumsum_buffer)
-        print("CUDA sorted ids:", sorted_ids_cuda)
-        print("Triton sorted ids:", sorted_ids_triton)
+        print(
+            "✅ CUDA and Triton implementations match : num_tokens={}, num_experts={}".format(
+                batch_size * seq_len, num_experts
+            )
+        )
     else:
         print("❌ CUDA and Triton implementations do not match")
         print("CUDA cumsum : ", cumsum_buffer)
-        print("CUDA sorted ids:", sorted_ids_cuda)
-        print("Triton sorted ids:", sorted_ids_triton)
         torch.set_printoptions(profile="full")
+        print("CUDA sorted ids:", sorted_ids_cuda_snapshot)
+        print("Triton sorted ids:", sorted_ids_triton_snapshot)
+        torch.set_printoptions(profile="default")
         print("CUDA expert_ids:", expert_ids_cuda)
         print("Triton expert_ids:", expert_ids_triton)
-        torch.set_printoptions(profile="default")
         print("CUDA num_tokens_post_pad:", num_tokens_post_pad_cuda)
         print("Triton num_tokens_post_pad:", num_tokens_post_pad_triton)
 
 
 batch_size_range = [2**i for i in range(0, 8)]
 seq_length_range = [2**i for i in range(14, 16)]
-# expert_ids_range = [2**i for i in range(3, 8)]
 configs = list(itertools.product(batch_size_range, seq_length_range))
 
 
@@ -283,7 +287,7 @@ def benchmark(batch_size, seq_len, provider):
     token_cnts_buffer = torch.zeros(
         (num_experts + 1) * num_experts, dtype=torch.int32, device=topk_ids.device
     )
-    cumsum_buffer = torch.emtpy(
+    cumsum_buffer = torch.empty(
         num_experts + 1, dtype=torch.int32, device=topk_ids.device
     )
 
@@ -331,15 +335,21 @@ if __name__ == "__main__":
         default="./configs/benchmark_ops/moe_align_blocks/",
         help="Path to save moe align benchmark results",
     )
+    parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="verify kernel",
+    )
     args = parser.parse_args()
 
-    # calculate_diff(batch_size=1, seq_len=1)
-    # calculate_diff(batch_size=5, seq_len=1)
-    # calculate_diff(batch_size=8, seq_len=1)
-    # calculate_diff(batch_size=32, seq_len=1)
-    # calculate_diff(batch_size=4, seq_len=1024)
+    if args.verify:
+        num_experts_range = [2**i for i in range(3, 8)]
 
-    # calculate_diff(batch_size=1, seq_len=16)
-    calculate_diff(batch_size=1, seq_len=16384 // 8)
+        configs = list(
+            itertools.product(batch_size_range, seq_length_range, num_experts_range)
+        )
 
-    # benchmark.run(print_data=True, save_path=args.save_path)
+        for bs, seq, num_experts in configs:
+            calculate_diff(batch_size=bs, seq_len=seq, num_experts=num_experts)
+    else:
+        benchmark.run(print_data=True, save_path=args.save_path)

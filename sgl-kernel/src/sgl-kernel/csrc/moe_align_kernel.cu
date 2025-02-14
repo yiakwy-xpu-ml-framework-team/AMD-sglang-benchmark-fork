@@ -60,6 +60,8 @@ __device__ __forceinline__ int32_t index(int32_t total_col, int32_t row, int32_t
 #define MAX_NUM_EXPERTS 256
 #define SHIFT_1_PAD     1
 
+#define USE_CUSUM_LOCAL_CACHE true
+
 namespace cg = cooperative_groups;
 
 template <typename scalar_t>
@@ -138,7 +140,6 @@ __global__ void moe_align_block_size_kernel(scalar_t* __restrict__ topk_ids, int
       local_offsets_buf[tid] = local_offsets[num_experts];
 
     }
-
     __syncthreads();
 
     // NOTE (yiakwy) : step 2, loop body
@@ -165,7 +166,6 @@ __global__ void moe_align_block_size_kernel(scalar_t* __restrict__ topk_ids, int
     }
 
   } // code block of computing cumsum
-
   __syncthreads();
 
 #define kElementsPerThr    16
@@ -195,7 +195,6 @@ __global__ void moe_align_block_size_kernel(scalar_t* __restrict__ topk_ids, int
     }
 
   } // code block of storing to cumsum
-
   __syncthreads();
 
   if (threadIdx.x < num_experts) {
@@ -203,7 +202,6 @@ __global__ void moe_align_block_size_kernel(scalar_t* __restrict__ topk_ids, int
       expert_ids[i / block_size] = threadIdx.x;
     }
   }
-
   __syncthreads();
 
   for (int i = start_idx; i < numel && i < start_idx + tokens_per_thread; ++i) {
@@ -258,9 +256,9 @@ __global__ void moe_align_block_size_multiblocks_kernel(scalar_t* __restrict__ t
       smem[threadIdx.x + i] = 0;
     }
   }
+  __syncthreads();
 
   int *shared_counts_base = &(shared_counts[0][0]);
-  __syncthreads();
 
   // NOTE (yiakwy) : since each block processes less tokens, less possibility for threads acces these localtions ([0][0], [4][0], [8][0], ...) simutaneously
   if (threadIdx.x * tokens_per_thread < tokens_per_block) {
@@ -319,7 +317,6 @@ __global__ void moe_align_block_size_multiblocks_kernel(scalar_t* __restrict__ t
       local_offsets_buf[threadIdx.x] = local_offsets[num_experts];
 
     }
-
     __syncthreads();
 
     // NOTE (yiakwy) : step 2, loop body
@@ -346,15 +343,14 @@ __global__ void moe_align_block_size_multiblocks_kernel(scalar_t* __restrict__ t
     }
 
   } // code block of computing local unaligned cumsum
-
   __syncthreads();
 
-// #ifdef DEBUG
+#ifdef DEBUG
   if (threadIdx.x == 0) {
     printf("[Block#%d/%d] local_offsets[0:num_experts+1] = [%d, %d, %d, ..., %d, %d]\n", blockIdx.x, gridDim.x, local_offsets[0], local_offsets[1], local_offsets[2], local_offsets[num_experts-1], local_offsets[num_experts]);
   }
   __syncthreads();
-// #endif
+#endif
 
   {
     if (tid < num_experts) {
@@ -376,67 +372,67 @@ __global__ void moe_align_block_size_multiblocks_kernel(scalar_t* __restrict__ t
     int fragments_per_block = CEILDIV(total_fragments, gridDim.x);
     int fragments_per_warp  = CEILDIV(fragments_per_block, FRAGS_PER_BLOCK);
 
-// #ifdef DEBUG
+#ifdef DEBUG
     if (tid == 0) {
       printf("[tid#0] total fragments : %d, fragments/block : %d, fragments/warp : %d\n", total_fragments, fragments_per_block, fragments_per_warp);
     }
-// #endif
+#endif
 
-    if (blockIdx.x * fragments_per_block < total_fragments) {
-      int *tokens_cnts_ptr = &(tokens_cnts[0]);
+    int *tokens_cnts_ptr = &(tokens_cnts[0]);
 
-      for (int i=0; i < gridDim.x; i += FRAG_SIZE_M) {
-        for ( int j=0; j < fragments_per_warp; j++) {
+    for (int i=0; i < gridDim.x; i += FRAG_SIZE_M) {
+      for ( int j=0; j < fragments_per_warp; j++) {
 
-          if (warp_id * fragments_per_warp < kWarpsToLoad * fragments_per_block) { // NOTE (yiakwy) : kWarpsToLoad warps (CUDA) for loading 16x16 fragment
-            const int kNumThrPerRow = WARP_SIZE / FRAG_SIZE_N;
-            int sRow = lane_id / kNumThrPerRow ;
+        if (warp_id * fragments_per_warp < kWarpsToLoad * fragments_per_block) { // NOTE (yiakwy) : kWarpsToLoad warps (CUDA) for loading 16x16 fragment
+          const int kNumThrPerRow = WARP_SIZE / FRAG_SIZE_N;
+          int sRow = lane_id / kNumThrPerRow ;
 
-            int sWarpColStride = kNumThrPerRow * kElementsPerAccess;
-            int sWarpColOff = warp_id * sWarpColStride;
-            int sThrColOff = lane_id % kNumThrPerRow * kElementsPerAccess;
+          int sWarpColStride = kNumThrPerRow * kElementsPerAccess;
+          int sWarpColOff = warp_id * sWarpColStride;
+          int sThrColOff = lane_id % kNumThrPerRow * kElementsPerAccess;
 
-            int sCol = sThrColOff + sWarpColOff;
+          int sCol = sThrColOff + sWarpColOff;
 
-            int gRow = i + sRow;
+          int gRow = i + sRow;
 
-            // int gCol = blockIdx.x * fragments_per_block * FRAG_SIZE_N+ lane_id % kNumThrPerRow * kElementsPerAccess + (warp_id * fragments_per_warp + j) * sColOffPart;
-            int gBlockColOff = blockIdx.x * fragments_per_block * FRAG_SIZE_N;
-            int gWarpColOff_0 = (warp_id / kWarpsToLoad * fragments_per_warp + j) * FRAG_SIZE_N;
-            int gWarpColOff_1 = warp_id % kWarpsToLoad * sWarpColStride;
+          int gBlockColOff = blockIdx.x * fragments_per_block * FRAG_SIZE_N;
+          int gWarpColOff_0 = (warp_id / kWarpsToLoad * fragments_per_warp + j) * FRAG_SIZE_N;
+          int gWarpColOff_1 = warp_id % kWarpsToLoad * sWarpColStride;
 
-            int gCol = gBlockColOff + gWarpColOff_0 + gWarpColOff_1 + sThrColOff;
+          int gCol = gBlockColOff + gWarpColOff_0 + gWarpColOff_1 + sThrColOff;
 
-            if (gRow < num_experts && gCol < num_experts) { // NOTE (yiakwy) : defensive guard
-              // NOTE (yiakwy) : useful to coalesce memory transaction when loading a column of data
-              int4 *tokens_cnts_4i_ptr = (int4 *)(tokens_cnts_ptr + (gRow+1) * num_experts + gCol);
-              int4 *shared_counts_4i_ptr = (int4 *)(shared_counts_base + sRow * FRAGS_PER_BLOCK * FRAG_SIZE_N + sCol);
+          if (gRow < num_experts && gCol < num_experts) { // NOTE (yiakwy) : defensive guard
+            // NOTE (yiakwy) : useful to coalesce memory transaction when loading a column of data
+            int4 *tokens_cnts_4i_ptr = (int4 *)(tokens_cnts_ptr + (gRow+1) * num_experts + gCol);
+            int4 *shared_counts_4i_ptr = (int4 *)(shared_counts_base + sRow * FRAGS_PER_BLOCK * FRAG_SIZE_N + sCol);
 
-              *shared_counts_4i_ptr = *tokens_cnts_4i_ptr;
-            }
-            __syncthreads();
+            *shared_counts_4i_ptr = *tokens_cnts_4i_ptr;
+          }
+        }
+        __syncthreads();
 
-            if (warp_id % kWarpsToLoad == 0) { // NOTE (yiakwy) : 1x warp (CUDA) for processing 16x16 fragment
-              for (int k=0; k < FRAG_SIZE_N; k+=2) { // NOTE (yiakwy) : this simple arangement enables thread 0 accessing addresses limited to bank 0, thread 16 accesses limited to bank 16, etc in CUDA.
-                int sRow = lane_id / FRAG_SIZE_N + k;
-                int sThrColOff = lane_id % FRAG_SIZE_N;
-                int sCol = sThrColOff + (warp_id / kWarpsToLoad) * FRAG_SIZE_N;
+        if (warp_id * fragments_per_warp < kWarpsToLoad * fragments_per_block) {
+          if (warp_id % kWarpsToLoad == 0) { // NOTE (yiakwy) : 1x warp (CUDA) for processing 16x16 fragment
+            for (int k=0; k < FRAG_SIZE_N; k+=2) { // NOTE (yiakwy) : this simple arangement enables thread 0 accessing addresses limited to bank 0, thread 16 accesses limited to bank 16, etc in CUDA.
+              int sRow = lane_id / FRAG_SIZE_N + k;
+              int sThrColOff = lane_id % FRAG_SIZE_N;
+              int sCol = sThrColOff + (warp_id / kWarpsToLoad) * FRAG_SIZE_N;
 
-                int gCol = gBlockColOff + gWarpColOff_0 + sThrColOff;
-                if (gCol < num_experts) { // NOTE (yiakwy) : defensive guard
-                  atomicAdd(tokens_cnts_ptr + gCol, *(shared_counts_base + sRow * FRAGS_PER_BLOCK * FRAG_SIZE_N + sCol));
-                }
+              int gBlockColOff = blockIdx.x * fragments_per_block * FRAG_SIZE_N;
+              int gWarpColOff_0 = (warp_id / kWarpsToLoad * fragments_per_warp + j) * FRAG_SIZE_N;
+              int gCol = gBlockColOff + gWarpColOff_0 + sThrColOff;
+              if (gCol < num_experts) { // NOTE (yiakwy) : defensive guard
+                atomicAdd(tokens_cnts_ptr + gCol, *(shared_counts_base + sRow * FRAGS_PER_BLOCK * FRAG_SIZE_N + sCol));
               }
             }
-            __syncthreads();
-
           }
+        }
+        __syncthreads();
 
-        } // end of j
+      } // end of j
 
-      } // end of i
+    } // end of i
 
-    }
     __threadfence_system();
     grid.sync();
 
@@ -447,15 +443,14 @@ __global__ void moe_align_block_size_multiblocks_kernel(scalar_t* __restrict__ t
     }
     __syncthreads();
 
-// #ifdef DEBUG
+#ifdef DEBUG
     if (tid == 0) {
       printf("[Block#%d] unaligned global offsets[0:num_experts+1] = [%d, %d, %d, ..., %d, %d]\n", blockIdx.x, local_offsets[0], local_offsets[1], local_offsets[2], local_offsets[num_experts-1], local_offsets[num_experts]);
     }
     __syncthreads();
-// #endif
+#endif
 
   } // code block of computing global cumsum
-
   __syncthreads();
 
   // NOTE (yiakwy) : convert unaligned cumsum to aligned cumsum
@@ -470,12 +465,12 @@ __global__ void moe_align_block_size_multiblocks_kernel(scalar_t* __restrict__ t
   }
   __syncthreads();
 
-// #ifdef DEBUG
+#ifdef DEBUG
   if (tid == 0) {
     printf("[Block#%d] aligned global offsets[0:num_experts+1] = [%d, %d, %d, ..., %d, %d]\n", blockIdx.x, local_offsets[0], local_offsets[1], local_offsets[2], local_offsets[num_experts-1], local_offsets[num_experts]);
   }
   __syncthreads();
-// #endif
+#endif
 
 #define kElementsPerThr    16
 #define kElementsPerAccess 4
@@ -488,9 +483,12 @@ __global__ void moe_align_block_size_multiblocks_kernel(scalar_t* __restrict__ t
       // NOTE(yiakwy) : loop body useful for workload with the number of experts upto 256
       for (int i=tid * kElementsPerThr ; i < (tid + 1) * kElementsPerThr; i += kElementsPerAccess) {
         *(int4 *)(cumsum + i) = *(int4 *)(local_offsets + i);
+// #ifdef DEBUG
+        *(int4 *)(tokens_cnts + i) = *(int4 *)(local_offsets + i);
+// #endif
       }
 
-      printf("[tid#%d] cumsum[%d] (%d) = local_offsets[%d] (%d)\n", tid, tid * kElementsPerThr, cumsum[tid * kElementsPerThr], tid * kElementsPerThr, local_offsets[tid * kElementsPerThr]);
+      // printf("[tid#%d] cumsum[%d] (%d) = local_offsets[%d] (%d %d %d %d ...)\n", tid, tid * kElementsPerThr, cumsum[tid * kElementsPerThr], tid * kElementsPerThr, local_offsets[tid * kElementsPerThr], local_offsets[tid * kElementsPerThr+1], local_offsets[tid * kElementsPerThr+2], local_offsets[tid * kElementsPerThr+3]);
     }
 
     if (tid == active_threads - 1) {
@@ -498,6 +496,9 @@ __global__ void moe_align_block_size_multiblocks_kernel(scalar_t* __restrict__ t
       #pragma unroll
       for (int i=tid * kElementsPerThr; i < num_experts+1; i++) {
         *(cumsum + i) = *(local_offsets + i);
+// #ifdef DEBUG
+        *(tokens_cnts + i) = *(local_offsets + i);
+// #endif
       }
     }
 
@@ -506,73 +507,55 @@ __global__ void moe_align_block_size_multiblocks_kernel(scalar_t* __restrict__ t
     }
 
   } // code block of storing to cumsum
-  __syncthreads();
+  __threadfence_system();
+  grid.sync();
 
-  if (tid == 0) {
-    printf("[tid#0] cumsum[0]=%d, cumsum[1]=%d, local_offsets[0]=%d, local_offsets[1]=%d\n", cumsum[0], cumsum[1], local_offsets[0], local_offsets[1]);
+  if (USE_CUSUM_LOCAL_CACHE) {
+  // NOTE (yiakwy) : sync cumsum to each block
+    if (blockIdx.x > 0) {
+      int active_threads = CEILDIV(num_experts+1, kElementsPerThr);
+
+      if (threadIdx.x < active_threads - 1) {
+        for (int i=threadIdx.x * kElementsPerThr ; i < (threadIdx.x + 1) * kElementsPerThr; i += kElementsPerAccess) {
+          *(int4 *)(local_offsets + i) = *(int4 *)(cumsum + i);
+        }
+      }
+
+      if (threadIdx.x == active_threads - 1) {
+        #pragma unroll
+        for (int i=threadIdx.x * kElementsPerThr; i < num_experts+1; i++) {
+          *(local_offsets + i) = *(cumsum + i);
+        }
+      }
+    }
   }
-
-  __syncthreads();
+  __threadfence_system();
+  grid.sync();
 
   if (tid < num_experts) {
     for (int i = local_offsets[tid]; i < local_offsets[tid + 1]; i += block_size) {
       expert_ids[i / block_size] = tid;
     }
   }
-
   __syncthreads();
 
-  // NOTE (yiakwy) : sync cumsum to each block
-  if (blockIdx.x > 0) {
-    int active_threads = CEILDIV(num_experts+1, kElementsPerThr);
-
-    if (threadIdx.x < active_threads - 1) {
-      for (int i=threadIdx.x * kElementsPerThr ; i < (threadIdx.x + 1) * kElementsPerThr; i += kElementsPerAccess) {
-        *(int4 *)(local_offsets + i) = *(int4 *)(cumsum + i);
-      }
-    }
-
-    if (threadIdx.x == active_threads - 1) {
-      #pragma unroll
-      for (int i=threadIdx.x * kElementsPerThr; i < num_experts+1; i++) {
-        *(local_offsets + i) = *(cumsum + i);
-      }
-    }
-  }
-
-  __syncthreads();
-
-  if (threadIdx.x < tokens_per_block) {
+  if (threadIdx.x * tokens_per_thread < tokens_per_block) {
     for (int i = start_idx; i < MIN(numel, end_idx); ++i) {
-      int rank_post_pad, old=numel, tok=i, expert_id = topk_ids[i];
-
-      int k=0;
-      do {
-        if (old != numel) { // NOTE (yiakwy) that means some block has brought value into the position and increment local rank_post_pad
-          int old_tok = tok;
-          tok = atomicMin(&sorted_token_ids[rank_post_pad], tok);
-
-          if (tid == 0) {
-            printf("[tid#0][k#%d] tok : %d -> %d, expert_id : %d -> %d\n", k, old_tok, tok, expert_id, topk_ids[tok]);
-          }
-
-          expert_id = topk_ids[tok];
-        }
-
-        rank_post_pad = atomicAdd(&local_offsets[expert_id], 1);
-
-        old = atomicCAS(&sorted_token_ids[rank_post_pad], numel, tok);
-
-        if (tid == 0) {
-          printf("[tid#0][k#%d] tok#%d [expert_id=%d], old / %d = sorted_token_ids[%d] = %d\n", k++, tok, expert_id, numel, rank_post_pad, old);
-        }
-
-      } while (old != numel);
-
-      // int32_t expert_id = topk_ids[i];
-      // int32_t rank_post_pad = atomicAdd(&local_offsets[expert_id], 1);
-      // sorted_token_ids[rank_post_pad] = i;
-
+      if (USE_CUSUM_LOCAL_CACHE) {
+        int rank_post_pad, old=i, tok=i, expert_id = topk_ids[i];
+        do {
+          rank_post_pad = atomicAdd(&local_offsets[expert_id], 1);
+          old = atomicCAS(&sorted_token_ids[rank_post_pad], numel, tok);
+        } while (old != numel && old != tok);
+      } else {
+        int32_t expert_id = topk_ids[i];
+#ifdef DEBUG
+        int32_t rank_post_pad = atomicAdd(&tokens_cnts[expert_id], 1);
+#else
+        int32_t rank_post_pad = atomicAdd(&cumsum[expert_id], 1);
+#endif
+        sorted_token_ids[rank_post_pad] = i;
+      }
     }
   }
 }
@@ -589,7 +572,7 @@ void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts, int64_t b
       kernel<<<1, 1024, 0, stream>>>(topk_ids.data_ptr<scalar_t>(), sorted_token_ids.data_ptr<int32_t>(),
                                     experts_ids.data_ptr<int32_t>(), num_tokens_post_pad.data_ptr<int32_t>(),
                                     num_experts, block_size, topk_ids.numel(), cumsum_buffer.data_ptr<int32_t>());
-      printf("%d blocks used.\n", 1);
+      // printf("%d blocks used.\n", 1);
     } else {
       auto kernel = moe_align_block_size_multiblocks_kernel<scalar_t>;
 // NOTE (yiakwy) : reduce registers consumed
@@ -599,12 +582,8 @@ void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts, int64_t b
       int32_t tokens_per_block = CEILDIV(topk_ids.sizes()[0], BLOCKS) * topk_ids.sizes()[1];
       int32_t tokens_per_thread = CEILDIV(tokens_per_block, BLOCK_SIZE);
 
-      printf("%d BLOCKS used. %d tokens per block. %d tokens per thread\n", BLOCKS, tokens_per_block, tokens_per_thread);
-      /*
-      kernel<<<BLOCKS, BLOCK_SIZE, 0, stream>>>(topk_ids.data_ptr<scalar_t>(), sorted_token_ids.data_ptr<int32_t>(),
-                                    experts_ids.data_ptr<int32_t>(), num_tokens_post_pad.data_ptr<int32_t>(),
-                                    num_experts, block_size, topk_ids.numel(), token_cnts_buffer.data_ptr<int32_t>(), cumsum_buffer.data_ptr<int32_t>(), tokens_per_block, tokens_per_thread, topk_ids.sizes()[1]);
-       */
+      // printf("%d BLOCKS used. %d tokens per block. %d tokens per thread\n", BLOCKS, tokens_per_block, tokens_per_thread);
+
       // NOTE (yiakwy) : remove const decorator for kernel args
       scalar_t* topk_ids_ptr = topk_ids.data_ptr<scalar_t>();
       int32_t* sorted_token_ids_ptr = sorted_token_ids.data_ptr<int32_t>();
@@ -619,9 +598,10 @@ void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts, int64_t b
         &experts_ids_ptr, &num_tokens_post_pad_ptr,
         &num_experts, &block_size, &num_tokens, &token_cnts_buffer_ptr, &cumsum_buffer_ptr, &tokens_per_block, &tokens_per_thread, &K
       };
-      // TODO (yiakwy) : remove
       cudaLaunchCooperativeKernel((void*)kernel, BLOCKS, BLOCK_SIZE, kernelArgs);
+#ifdef DEBUG
       checkCudaErrors(cudaDeviceSynchronize());
+#endif
     }
   });
 }
