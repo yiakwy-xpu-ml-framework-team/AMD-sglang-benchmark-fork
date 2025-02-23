@@ -124,4 +124,9 @@ static __inline__ __host__ __device__ hipError_t cudaLaunchCooperativeKernel(con
   return hipLaunchCooperativeKernel(f, gridDim, blockDimX, kernelParams, 0, hipStreamDefault);
 }
 
+static __inline__ __host__ __device__ hipError_t cudaLaunchKernel(const void* f, dim3 gridDim, dim3 blockDimX, 
+                                                                  void** kernelParams) {
+  return hipLaunchKernel(f, gridDim, blockDimX, kernelParams, 0, hipStreamDefault);
+}
+
 #endif
