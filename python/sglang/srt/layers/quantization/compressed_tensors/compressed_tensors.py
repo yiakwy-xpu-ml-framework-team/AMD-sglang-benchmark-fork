@@ -111,6 +111,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         prefix: str,
     ) -> Optional["QuantizeMethodBase"]:
 
+        # fuse_moe methods depends on quantization methods, hence we move FuseMoE here to resolve circulr dependency 
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         # Check if the layer is skipped for quantization.

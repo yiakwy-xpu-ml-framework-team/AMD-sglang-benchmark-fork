@@ -10,12 +10,6 @@ import torch
 from compressed_tensors import CompressionFormat
 from compressed_tensors.quantization import QuantizationStrategy
 
-# from sglang.srt.layers.moe.fused_moe_triton import (
-#     FusedMoE,
-#     FusedMoEMethodBase,
-#     FusedMoeWeightScaleSupported,
-# )
-
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe_weight_qunatization_support_method import FusedMoeWeightScaleSupported, FusedMoEMethodBase
 
 from sglang.srt.layers.moe.topk import select_experts
