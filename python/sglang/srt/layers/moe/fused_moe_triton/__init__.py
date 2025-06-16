@@ -6,11 +6,11 @@ from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
     fused_experts,
     get_config_file_name,
 )
-from sglang.srt.layers.moe.fused_moe_triton.layer import (
-    FusedMoE,
+from sglang.srt.layers.moe.fused_moe_triton.fused_moe_weight_qunatization_support_method import (
+    FusedMoEMethodBase,
+    FusedMoeWeightScaleSupported,
 )
-
-from sglang.srt.layers.moe.fused_moe_triton.fused_moe_weight_qunatization_support_method import FusedMoeWeightScaleSupported, FusedMoEMethodBase
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
 _config: Optional[Dict[str, Any]] = None
 

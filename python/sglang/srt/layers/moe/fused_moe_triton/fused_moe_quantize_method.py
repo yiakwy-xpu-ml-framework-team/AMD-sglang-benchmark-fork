@@ -5,19 +5,16 @@ from typing import Callable, List, Optional, Tuple
 import torch
 
 from sglang.srt.custom_op import CustomOp
-
 from sglang.srt.layers.moe.fused_moe_native import moe_forward_native
 from sglang.srt.layers.moe.topk import select_experts
-
+from sglang.srt.layers.quantization.base_config import (
+    QuantizationConfig,
+    QuantizeMethodBase,
+)
 from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
 from sglang.srt.layers.quantization.int8_kernel import (
     per_token_group_quant_int8,
     per_token_quant_int8,
-)
-
-from sglang.srt.layers.quantization.base_config import (
-    QuantizationConfig,
-    QuantizeMethodBase,
 )
 from sglang.srt.utils import get_bool_env_var, is_hip, permute_weight, set_weight_attrs
 
@@ -26,6 +23,12 @@ if torch.cuda.is_available():
 else:
     fused_experts = None  # type: ignore
 
+import logging
+
+from sglang.srt.layers.moe.fused_moe_triton.fused_moe_weight_qunatization_support_method import (
+    FusedMoEMethodBase,
+    FusedMoeWeightScaleSupported,
+)
 from sglang.srt.utils import (
     direct_register_custom_op,
     get_bool_env_var,
@@ -33,8 +36,6 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
 )
-
-import logging
 
 logger = logging.getLogger(__name__)
 
@@ -49,40 +50,6 @@ if _is_cuda:
     from sglang.srt.layers.quantization.fp8_kernel import (
         sglang_per_token_group_quant_fp8,
     )
-
-# class FusedMoeWeightScaleSupported(Enum):
-#     TENSOR = "tensor"
-#     CHANNEL = "channel"
-#     GROUP = "group"
-#     BLOCK = "block"
-
-from sglang.srt.layers.moe.fused_moe_triton.fused_moe_weight_qunatization_support_method import FusedMoeWeightScaleSupported
-
-class FusedMoEMethodBase(QuantizeMethodBase):
-
-    @abstractmethod
-    def create_weights(
-        self,
-        layer: torch.nn.Module,
-        num_experts: int,
-        hidden_size: int,
-        intermediate_size: int,
-        params_dtype: torch.dtype,
-        **extra_weight_attrs,
-    ):
-        raise NotImplementedError
-
-    @abstractmethod
-    def apply(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-        router_logits: torch.Tensor,
-        top_k: int,
-        renormalize: bool,
-        use_grouped_topk: bool,
-    ) -> torch.Tensor:
-        raise NotImplementedError
 
 
 class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):

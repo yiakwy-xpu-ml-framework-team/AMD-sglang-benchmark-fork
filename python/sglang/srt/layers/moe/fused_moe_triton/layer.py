@@ -1,5 +1,6 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/model_executor/layers/fused_moe/layer.py
 
+import logging
 from abc import abstractmethod
 from enum import Enum
 from typing import Callable, List, Optional, Tuple
@@ -20,8 +21,6 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.utils import get_bool_env_var, is_hip, permute_weight, set_weight_attrs
 
-import logging
-
 _is_hip = is_hip()
 
 if _is_hip:
@@ -30,7 +29,10 @@ if _is_hip:
 logger = logging.getLogger(__name__)
 
 
-from sglang.srt.layers.moe.fused_moe_triton.fused_moe_weight_qunatization_support_method import FusedMoeWeightScaleSupported
+from sglang.srt.layers.moe.fused_moe_triton.fused_moe_weight_qunatization_support_method import (
+    FusedMoEMethodBase,
+    FusedMoeWeightScaleSupported,
+)
 
 
 class FusedMoE(torch.nn.Module):
@@ -106,7 +108,9 @@ class FusedMoE(torch.nn.Module):
 
         if quant_config is None:
             # TODO(yiakwy) : UnquantizedFusedMethnod depends on qunatization method which in turn relies on FusedMoE implementation, we move here to resolve circular dependencies
-            from sglang.srt.layers.moe.fused_moe_triton.fused_moe_quantize_method import UnquantizedFusedMoEMethod
+            from sglang.srt.layers.moe.fused_moe_triton.fused_moe_quantize_method import (
+                UnquantizedFusedMoEMethod,
+            )
 
             self.quant_method: Optional[QuantizeMethodBase] = (
                 UnquantizedFusedMoEMethod()
