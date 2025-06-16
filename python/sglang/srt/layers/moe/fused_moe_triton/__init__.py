@@ -8,9 +8,11 @@ from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import (
     FusedMoE,
-    FusedMoEMethodBase,
-    FusedMoeWeightScaleSupported,
+    # FusedMoEMethodBase,
+    # FusedMoeWeightScaleSupported,
 )
+
+from sglang.srt.layers.moe.fused_moe_triton.fused_moe_weight_qunatization_support_method import FusedMoeWeightScaleSupported, FusedMoEMethodBase
 
 _config: Optional[Dict[str, Any]] = None
 

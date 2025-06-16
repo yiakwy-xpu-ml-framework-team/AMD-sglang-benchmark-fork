@@ -23,7 +23,7 @@ from sglang.srt.layers.linear import (
     LinearMethodBase,
     UnquantizedLinearMethod,
 )
-from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
@@ -110,6 +110,8 @@ class CompressedTensorsConfig(QuantizationConfig):
         layer: torch.nn.Module,
         prefix: str,
     ) -> Optional["QuantizeMethodBase"]:
+
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         # Check if the layer is skipped for quantization.
         # TODO (@robertgshaw2): support module names
