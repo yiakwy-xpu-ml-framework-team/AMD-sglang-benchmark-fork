@@ -222,6 +222,11 @@ class Qwen2DecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
+        # TODO (yiakwy) : add control
+        self.R1 = torch.nn.Parameter(
+            torch.eye(config.hidden_size, dtype=config.torch_dtype)
+        )
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -229,6 +234,11 @@ class Qwen2DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+
+        # TODO (yiakwy) : add control
+        # rotate hidden states
+        hidden_states = torch.matmul(hidden_states, self.R1.T)
+
         # Self Attention
         if residual is None:
             residual = hidden_states
@@ -244,7 +254,16 @@ class Qwen2DecoderLayer(nn.Module):
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
-        return hidden_states, residual
+
+        # TODO (yiakwy) : add control
+        hidden_states = residual + hidden_states
+
+        # rotate back hiddenstates
+        hidden_states = torch.matmul(hidden_states, self.R1)
+
+        # TODO (yiakwy) : add control
+        # return hidden_states, residual
+        return hidden_states, None
 
 
 class Qwen2Model(nn.Module):
