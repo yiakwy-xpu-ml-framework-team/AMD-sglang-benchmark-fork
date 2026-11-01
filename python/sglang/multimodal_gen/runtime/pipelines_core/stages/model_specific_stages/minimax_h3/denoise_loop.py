@@ -11,7 +11,12 @@ from __future__ import annotations
 from contextlib import AbstractContextManager, nullcontext
 from typing import Any, Callable
 
+import logging
+import os
+import time
 import torch
+
+logger = logging.getLogger(__name__)
 
 from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
     MINIMAX_H3_ADALN_MODALITY_NUM,
@@ -595,7 +600,19 @@ def minimax_h3_denoise_loop(
         rollout_ctx.batch._h3_rollout_sigma_max = float(max(sigmas_video))
         video_target = video_rows[video_target_slice]
         rollout_ctx.collector.record_initial(video_target.detach().clone())
+    _per_step = os.environ.get("SGLANG_PER_STEP_TIMING") == "1"
+    if _per_step:
+        torch.cuda.synchronize()
+        _t0 = time.perf_counter()
     for step in range(num_steps):
+        if _per_step:
+            torch.cuda.synchronize()
+            logger.info(
+                "[per-step] denoising_step %d took %.1f ms",
+                step,
+                (time.perf_counter() - _t0) * 1e3,
+            )
+            _t0 = time.perf_counter()
         step_cm = step_profiler(step) if step_profiler is not None else nullcontext()
         with step_cm:
             s_v = sigmas_video[step]

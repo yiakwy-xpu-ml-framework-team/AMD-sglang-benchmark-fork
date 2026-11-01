@@ -559,6 +559,32 @@ class _FP8FlashAttentionSM120BackendResolver(_CudaAttentionBackendResolver):
             return AttentionBackendEnum.TORCH_CUDNN_SDPA
 
 
+class _RotFp8AttentionBackendResolver(_CudaAttentionBackendResolver):
+    backend = AttentionBackendEnum.ROT_FP8
+
+    @classmethod
+    def resolve(cls, platform) -> str | AttentionBackendEnum:
+        if platform.get_device_capability() != (9, 0):
+            logger.warning(
+                "rot_fp8 attention needs an SM90 (Hopper) device; "
+                "falling back to Flash Attention."
+            )
+            return AttentionBackendEnum.FA
+        try:
+            from sglang.multimodal_gen.runtime.layers.attention.backends.rot_fp8_attn import (  # noqa: F401
+                RotFp8AttentionBackend,
+            )
+
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.rot_fp8_attn.RotFp8AttentionBackend"
+        except ImportError as error:
+            logger.warning(
+                "rot_fp8 attention backend failed to import (%s); "
+                "falling back to Flash Attention.",
+                error,
+            )
+            return AttentionBackendEnum.FA
+
+
 _CUDA_ATTENTION_BACKEND_RESOLVERS = {
     resolver.backend: resolver
     for resolver in (
@@ -583,6 +609,7 @@ _CUDA_ATTENTION_BACKEND_RESOLVERS = {
         _FlashAttention2BackendResolver,
         _FlashAttentionBackendResolver,
         _FP8FlashAttentionSM120BackendResolver,
+        _RotFp8AttentionBackendResolver,
     )
 }
 

@@ -17,6 +17,7 @@ from enum import Enum
 from functools import lru_cache
 from typing import Any
 
+import os
 import torch
 import torch.nn as nn
 
@@ -2096,6 +2097,12 @@ class DenoisingStage(PipelineStage):
             with self.progress_bar(
                 total=ctx.num_inference_steps, batch=batch
             ) as progress_bar:
+                _per_step_timing = os.environ.get("SGLANG_PER_STEP_TIMING") == "1"
+                if _per_step_timing:
+                    torch.cuda.synchronize()
+
+                    _step_t0 = time.perf_counter()
+                
                 for step_index, t_host in enumerate(timesteps_cpu):
                     # Use ``:.4g`` so flow-matching schedulers (e.g. FLUX) that
                     # use non-integer timesteps keep their precision in markers.
@@ -2132,6 +2139,14 @@ class DenoisingStage(PipelineStage):
 
                         if not ctx.is_warmup:
                             self.step_profile()
+                        if _per_step_timing:
+                            torch.cuda.synchronize()
+                            logger.info(
+                                "[per-step] denoising_step %d took %.1f ms",
+                                step_index,
+                                (time.perf_counter() - _step_t0) * 1e3,
+                            )
+                            _step_t0 = time.perf_counter()
 
         denoising_end_time = time.time()
 

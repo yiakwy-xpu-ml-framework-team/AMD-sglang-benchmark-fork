@@ -20,7 +20,9 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+import logging
 import msgspec
+import os
 import torch
 
 from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
@@ -306,10 +308,57 @@ def _fa_varlen(
     scale: float,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    # NOTE (yiakwy): The video DiT's window/varlen attention is the
+    # dominant KV consumer in the H3 denoise.
+    #
+    # e4m3 K/V here halves the KV read and runs the QK^T/PV on the 
+    # fp8 tensor cores.  
+    # 
+    # Orthogonal H64 rotation + per-tensor amax descales. 
+    # K-offset cross-term: per-(q-row) constant :
+    #   - softmax-invariant
+    _fp8 = os.environ.get("SGLANG_FP8_KV") == "1"
+    _prof = os.environ.get("SGLANG_FP8_PROFILE") == "1"
+    if _fp8 and q.dtype == torch.bfloat16:
+        import time as _time
+
+        if _prof:
+            torch.cuda.synchronize()
+            _q0 = _time.perf_counter()
+
+        def _rot_h64(x):
+            if not hasattr(_rot_h64, "_R"):
+                m = torch.ones(1, 1, device=x.device)
+                for _ in range(6):
+                    m = torch.cat(
+                        [torch.cat([m, m], 1), torch.cat([m, -m], 1)], 0
+                    )
+                _rot_h64._R = torch.block_diag(m, m).to(torch.float32) / 8.0
+            return (x.float() @ _rot_h64._R.T).to(x.dtype)
+
+        q8 = _rot_h64(q)
+        k8 = _rot_h64(k)
+
+        _sq = (q8.float().abs().amax().clamp_min(1e-12) / 448.0).item()
+        _sk = (k8.float().abs().amax().clamp_min(1e-12) / 448.0).item()
+
+        _sv = (v.float().abs().amax().clamp_min(1e-12) / 448.0).item()
+        
+        q8 = (q8.float() / _sq).clamp(-448, 448).to(torch.float8_e4m3fn)
+        k8 = (k8.float() / _sk).clamp(-448, 448).to(torch.float8_e4m3fn)
+        v8 = (v.float() / _sv).clamp(-448, 448).to(torch.float8_e4m3fn)
+        if _prof:
+            torch.cuda.synchronize()
+            _quant_ms = (_time.perf_counter() - _q0) * 1e3
+            _k0 = _time.perf_counter()
+        qq, kk, vv = q8, k8, v8
+    else:
+        qq, kk, vv = q, k, v
+
     attn_out = flash_attn_varlen_func(
-        q,
-        k,
-        v,
+        qq,
+        kk,
+        vv,
         cu_seqlens_q=cu_q,
         cu_seqlens_k=cu_k,
         max_seqlen_q=max_q,
@@ -317,9 +366,30 @@ def _fa_varlen(
         softmax_scale=scale,
         causal=False,
         ver=_flash_attn_backend.fa_ver,
+        q_descale=torch.full((1, kk.shape[-2]),
+                             _sk if _fp8 and q.dtype == torch.bfloat16 else 1.0,
+                             device=kk.device, dtype=torch.float32)
+        if _fp8 and q.dtype == torch.bfloat16 else None,
+        k_descale=torch.full((1, kk.shape[-2]),
+                             _sk if _fp8 and q.dtype == torch.bfloat16 else 1.0,
+                             device=kk.device, dtype=torch.float32)
+        if _fp8 and q.dtype == torch.bfloat16 else None,
+        v_descale=torch.full((1, kk.shape[-2]),
+                             _sv if _fp8 and q.dtype == torch.bfloat16 else 1.0,
+                             device=kk.device, dtype=torch.float32)
+        if _fp8 and q.dtype == torch.bfloat16 else None,
         out=out,
     )
     attn_out = attn_out[0] if isinstance(attn_out, tuple) else attn_out
+    if _fp8 and q.dtype == torch.bfloat16 and _prof:
+        torch.cuda.synchronize()
+        logger.info(
+            "[h3-fp8] quant %.1f ms | kernel %.1f ms | q %s k %s "
+            "(cu segments %d)",
+            _quant_ms,
+            (_time.perf_counter() - _k0) * 1e3,
+            tuple(q8.shape), tuple(k8.shape), cu_q.numel() - 1,
+        )
     if out is not None and attn_out.data_ptr() != out.data_ptr():
         out.copy_(attn_out)
         return out

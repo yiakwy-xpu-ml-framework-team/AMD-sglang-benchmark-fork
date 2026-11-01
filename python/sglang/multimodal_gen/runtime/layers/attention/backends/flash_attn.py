@@ -1,6 +1,10 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 # SPDX-License-Identifier: Apache-2.0
 import functools
+import os
+import logging
+
+logger = logging.getLogger(__name__)
 from dataclasses import dataclass
 from numbers import Integral
 from typing import Any, List, Optional, Tuple
@@ -459,6 +463,85 @@ class FlashAttentionImpl(AttentionImpl):
         # - fa_ver == 4: call custom ops with FIXED return schema
         if fa_ver == 3:
             flash_attn_op = flash_attn_varlen_func
+
+            # NOTE (yiakwy): enable fp8 KV path 
+            #  - env SGLANG_FP8_KV=1, 
+            #  - profile SGLANG_FP8_PROFILE=1.  
+            if os.environ.get("SGLANG_FP8_KV") == "1":
+                _fp8_profile = os.environ.get("SGLANG_FP8_PROFILE") == "1"
+                if _fp8_profile:
+                    torch.cuda.synchronize()
+                    import time as _time
+
+                    _q0 = _time.perf_counter()
+
+                def _rot_h64(x):
+                    if not hasattr(_rot_h64, "_R"):
+                        m = torch.ones(1, 1, device=x.device)
+                        for _ in range(6):
+                            m = torch.cat(
+                                [torch.cat([m, m], 1), torch.cat([m, -m], 1)], 0
+                            )
+                        _rot_h64._R = torch.block_diag(m, m).to(torch.float32) / 8.0
+                    return (x.float() @ _rot_h64._R.T).to(x.dtype)
+
+                # E4M3 K/V + per-tensor amax descales + orthogonal H64 rotation.
+                q8 = _rot_h64(query)
+                k8 = _rot_h64(key)
+
+                # [batch, heads_k] fp32 descales; the amax is per-tensor here
+                batch = q8.shape[0] if q8.dim() == 4 else 1
+                nheads_k = key.shape[-2]
+
+                dev, dt = q8.device, torch.float32
+
+                _sv = (q8.float().abs().amax().clamp_min(1e-12) / 448.0).item()
+                _sk = (k8.float().abs().amax().clamp_min(1e-12) / 448.0).item()
+
+                _vv = (value.float().abs().amax().clamp_min(1e-12) / 448.0).item()
+
+                sc_q = torch.full((batch, nheads_k), _sv, device=dev, dtype=dt)
+                sc_k = torch.full((batch, nheads_k), _sk, device=dev, dtype=dt)
+                sc_v = torch.full((batch, nheads_k), _vv, device=dev, dtype=dt)
+
+                q8 = (q8.float() / _sv).clamp(-448, 448).to(torch.float8_e4m3fn)
+                k8 = (k8.float() / _sk).clamp(-448, 448).to(torch.float8_e4m3fn)
+
+                v8 = (value.float() / _vv).clamp(-448, 448).to(torch.float8_e4m3fn)
+
+                if _fp8_profile:
+                    torch.cuda.synchronize()
+                    _quant_ms = (_time.perf_counter() - _q0) * 1e3
+                    _k0 = _time.perf_counter()
+
+                output = flash_attn_op(
+                    q=q8.view(torch.float8_e4m3fn),
+                    k=k8.view(torch.float8_e4m3fn),
+                    v=v8.view(torch.float8_e4m3fn),
+                    cu_seqlens_q=None,
+                    cu_seqlens_k=None,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_k=max_seqlen_k,
+                    softmax_scale=self.softmax_scale,
+                    causal=self.causal,
+                    q_descale=sc_q,
+                    k_descale=sc_k,
+                    v_descale=sc_v,
+                    return_softmax_lse=return_softmax_lse,
+                    ver=fa_ver,
+                )
+
+                if _fp8_profile:
+                    torch.cuda.synchronize()
+                    logger.info(
+                        "[fp8-attn] quant %.1f ms | kernel %.1f ms | "
+                        "q %s k %s v %s",
+                        _quant_ms,
+                        (_time.perf_counter() - _k0) * 1e3,
+                        tuple(q8.shape), tuple(k8.shape), tuple(v8.shape),
+                    )
+                return output
+
             output = flash_attn_op(
                 q=query,
                 k=key,
@@ -607,6 +690,91 @@ class FlashAttentionImpl(AttentionImpl):
                 q_seq_lens_cpu=seq_lens_cpu,
                 kv_seq_lens_cpu=seq_lens_cpu,
             )
+        
+        # NOTE (yiakwy): fp8 KV path 
+        #  - env SGLANG_FP8_KV=1, 
+        #  - profile SGLANG_FP8_PROFILE=1
+        if os.environ.get("SGLANG_FP8_KV") == "1" and query.dtype == torch.bfloat16:
+            _fp8_profile = os.environ.get("SGLANG_FP8_PROFILE") == "1"
+            if _fp8_profile:
+                torch.cuda.synchronize()
+                import time as _time
+
+                _q0 = _time.perf_counter()
+
+            def _rot_h64(x):
+                if not hasattr(_rot_h64, "_R"):
+                    m = torch.ones(1, 1, device=x.device)
+                    for _ in range(6):
+                        m = torch.cat(
+                            [torch.cat([m, m], 1), torch.cat([m, -m], 1)], 0
+                        )
+                    _rot_h64._R = torch.block_diag(m, m).to(torch.float32) / 8.0
+                return (x.float() @ _rot_h64._R.T).to(x.dtype)
+
+            # E4M3 K/V + (seg, head) amax descales + orthogonal H64 rotation.
+            q8 = _rot_h64(query)
+            k8 = _rot_h64(key)
+
+            def _seg_head_scale(xf, cu):
+                # some segments are empty (zero-length ranges in the cu
+                # layout): give them a unit scale and skip the amax
+                nseg = cu.numel() - 1
+                H = xf.shape[-2]
+                sc = torch.ones(nseg, H, device=xf.device, dtype=torch.float32)
+                bounds = [int(v) for v in cu.tolist()]
+                for i in range(nseg):
+                    seg = xf[bounds[i]: bounds[i + 1]]
+                    if seg.shape[0] == 0:
+                        continue
+                    sc[i] = seg.abs().amax(dim=(0, 2)).clamp_min(1e-12) / 448.0
+                seg_id = torch.repeat_interleave(
+                    torch.arange(nseg, device=xf.device),
+                    torch.diff(cu),
+                )
+                return sc, seg_id
+
+            qf = q8.float(); kf = k8.float(); vf = value.float()
+            sc_q, sid_q = _seg_head_scale(qf, cu_seqlens)
+            sc_k, sid_k = _seg_head_scale(kf, cu_seqlens)
+            sc_v, sid_v = _seg_head_scale(vf, cu_seqlens)
+            q8 = (qf / sc_q[sid_q][:, :, None]).clamp(-448, 448).to(torch.float8_e4m3fn)
+            k8 = (kf / sc_k[sid_k][:, :, None]).clamp(-448, 448).to(torch.float8_e4m3fn)
+            v8 = (vf / sc_v[sid_v][:, :, None]).clamp(-448, 448).to(torch.float8_e4m3fn)
+
+            if _fp8_profile:
+                torch.cuda.synchronize()
+                _quant_ms = (_time.perf_counter() - _q0) * 1e3
+                _k0 = _time.perf_counter()
+
+            output = flash_attn_varlen_func(
+                q8.view(torch.float8_e4m3fn),
+                k8.view(torch.float8_e4m3fn),
+                v8.view(torch.float8_e4m3fn),
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=max_seqlen,
+                max_seqlen_k=max_seqlen,
+                softmax_scale=self.softmax_scale,
+                causal=self.causal,
+                q_descale=sc_q,
+                k_descale=sc_k,
+                v_descale=sc_v,
+                ver=fa_ver,
+            )
+
+            if _fp8_profile:
+                torch.cuda.synchronize()
+                logger.info(
+                    "[varlen-fp8] quant %.1f ms | kernel %.1f ms | "
+                    "q %s k %s segments %d",
+                    _quant_ms,
+                    (_time.perf_counter() - _k0) * 1e3,
+                    tuple(q8.shape), tuple(k8.shape),
+                    cu_seqlens.numel() - 1,
+                )
+            return output[0] if isinstance(output, tuple) else output
+
         output = flash_attn_varlen_func(
             query,
             key,

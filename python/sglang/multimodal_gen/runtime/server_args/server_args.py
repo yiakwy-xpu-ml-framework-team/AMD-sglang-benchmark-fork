@@ -664,7 +664,17 @@ class ServerArgs(DisaggServerArgsMixin):
 
     @property
     def broker_port(self) -> int:
-        return self.port + 1
+        # NOTE (yiakwy): using linear probing `port+1` for agentic task 
+        import socket as _socket
+        base = self.port + 1
+        for cand in range(base, base + 20):
+            with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as sk:
+                try:
+                    sk.bind(("0.0.0.0", cand))
+                    return cand
+                except OSError:
+                    continue
+        return base
 
     @property
     def cancel_endpoint(self) -> str | None:

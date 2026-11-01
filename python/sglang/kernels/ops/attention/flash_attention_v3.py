@@ -29,6 +29,59 @@ def _call_fa3_kernel(kernel, *args, out=None, **kwargs):
 
 @cache_once
 def _load_fa3_kernels():
+    # TODO (yiakwy) : SGLANG_FA3_WHEEL_SITE point to flash_attn_interface.py
+    # in local environment, will be reomved before PR
+    site = os.environ.get("SGLANG_FA3_WHEEL_SITE")
+    if site:
+        import importlib.util as _ilu
+
+        spec = _ilu.spec_from_file_location(
+            "fa3_wheel_interface", os.path.join(site, "flash_attn_interface.py")
+        )
+        mod = _ilu.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        def _only_qv_tolerant(kernel):
+            import functools, inspect
+
+            _sig = set(inspect.signature(kernel).parameters)
+
+            @functools.wraps(kernel)
+            def wrapper(*args, only_qv=False, **kwargs):
+                if only_qv:
+                    raise NotImplementedError(
+                        "FA3-wheel fallback does not implement only_qv"
+                    )
+                want_lse = kwargs.pop("return_softmax_lse", False)
+                
+                dropped = {k: v for k, v in kwargs.items() if k not in _sig}
+                bad = {k: v for k, v in dropped.items() if v is not None}
+                if bad:
+                    raise NotImplementedError(
+                        f"FA3-wheel fallback lacks supported values for {bad}"
+                    )
+                
+                kwargs = {k: v for k, v in kwargs.items() if k in _sig}
+                
+                # the wheel always returns (out, lse)
+                out = kernel(*args, **kwargs)
+                if isinstance(out, tuple) and not want_lse:
+                    return out[0]
+                return out
+
+            return wrapper
+
+        logger.info(f"FA3 kernels loaded from the flash-attn-3 wheel at {site}")
+        return {
+            name: _only_qv_tolerant(getattr(mod, name))
+            for name in (
+                "flash_attn_varlen_func",
+                "flash_attn_with_kvcache",
+                "flash_attn_func",
+            )
+            if hasattr(mod, name)
+        }
+
     # By default, we use the implementation from sgl-kernel,
     # which is expected to be more stable and compatible
     if envs.SGLANG_USE_SGL_FA3_KERNEL.get():
