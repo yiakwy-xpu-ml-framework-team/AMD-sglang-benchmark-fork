@@ -1,16 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
-"""fp8_fa_sm120 attention backend against cuDNN SDPA on MiniMax-H3 style inputs.
+"""SM120a rotated-FP8 (K-only offset) backend against cuDNN SDPA.
 
-Needs an SM120 GPU; skipped elsewhere. Shapes are kept small (8 heads) so the
-CuTe-DSL compile and the runs stay in seconds.
+Needs an SM120/SM121 GPU; skipped elsewhere. Shapes are kept small (8 heads) so
+the CuTe-DSL compile and the runs stay in seconds.
 """
 
 import pytest
 import torch
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
-    reason="fp8_fa_sm120 attention needs an SM120 GPU",
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((12, 0), (12, 1)),
+    reason="fp8_fa_sm120 attention needs an SM120/SM121 GPU",
 )
 
 HEADS = 8
@@ -19,7 +20,7 @@ SOFTMAX_SCALE = HEAD_DIM**-0.5
 
 
 def _make_impls(causal=False):
-    from sglang.multimodal_gen.runtime.layers.attention.backends.fp8_fa_sm120_attn import (
+    from sglang.multimodal_gen.runtime.layers.attention.backends.rot_fp8_attn_sm120a_ref import (
         FP8FlashAttentionSM120Impl,
     )
     from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import (
@@ -218,6 +219,41 @@ def test_causal_falls_back_to_cudnn():
     assert _compiled_kernels() == kernels_before
 
 
+def test_rotated_k_offset_improves_shifted_k():
+    """K centering should help when K has a non-zero mean; rotation is orthogonal."""
+    from sglang.kernels.ops.attention.fp8_fa_sm120 import (
+        calibrate_k_offset,
+        fp8_attention,
+    )
+
+    torch.manual_seed(1)
+    sequence = 4096
+    q, k, v = _fused_qkv_views(sequence)
+    q = q.contiguous()
+    k = (k + 2.0).contiguous()
+    v = v.contiguous()
+    _, reference = _make_impls()
+    expected = reference.forward(q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0), None)[
+        0
+    ]
+
+    plain, _ = fp8_attention(
+        q, k, v, softmax_scale=SOFTMAX_SCALE, rotate=False
+    )
+    rotated, _ = fp8_attention(
+        q,
+        k,
+        v,
+        softmax_scale=SOFTMAX_SCALE,
+        k_offset=calibrate_k_offset(k),
+        rotate=True,
+    )
+
+    plain_rms, _ = _error_metrics(plain, expected)
+    rotated_rms, _ = _error_metrics(rotated, expected)
+    assert rotated_rms < plain_rms
+
+
 def test_backend_resolves_by_name():
     from sglang.multimodal_gen.runtime.platforms import (
         AttentionBackendEnum,
@@ -227,7 +263,9 @@ def test_backend_resolves_by_name():
     class_path = current_platform.get_attn_backend_cls_str(
         AttentionBackendEnum.FP8_FA_SM120, HEAD_DIM, torch.bfloat16
     )
-    assert class_path.endswith("fp8_fa_sm120_attn.FP8FlashAttentionSM120Backend")
+    assert class_path.endswith(
+        "rot_fp8_attn_sm120a_ref.FP8FlashAttentionSM120Backend"
+    )
 
 
 if __name__ == "__main__":

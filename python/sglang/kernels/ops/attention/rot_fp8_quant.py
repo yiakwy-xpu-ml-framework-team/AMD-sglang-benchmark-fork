@@ -37,7 +37,36 @@ import torch
 
 _HEAD_DIM = 128
 _H64_BLOCK = 64
-_SRC = Path(__file__).resolve().parent / "rot_fp8_quant" / "fa3_f8_head_quant.cu"
+
+_JIT_SRC = Path(__file__).resolve().parent / "rot_fp8_quant" / "fa3_f8_head_quant.cu"
+
+
+# TODO(yiakwy): Hopper FP8 offset/calibration parity with rot_nvfp4_quant.py.
+#
+# The SM120a sibling (``fp8_fa_sm120/offsets.py`` + ``plan.py``) now implements
+# the K-only H64 + mean-first cache convention; mirror that here when Hopper FP8
+# is enabled.
+#
+# This wrapper currently passes empty offsets to the per-head quantizer, so it
+# runs the *no-offset* FP8 baseline.  The kernel already supports the calibrated
+# K offset: ``attn_qat_infer.hopper.prefill._fa3_impl`` uses
+# ``k_offset = mean_{b,s} H64(K)`` and passes it to
+# ``preprocess_k_head_fp8_cuda(k, empty, k_offset)``.  H64 is linear, so
+# calibrate mean-first (``H64(K.mean(dim=(0, 1)))``), not by rotating the whole
+# sequence before the reduction.
+#
+# Do not add a Q offset here: ``-oq . H64(K)`` is a per-key bias and the
+# pristine FA3 ``q/k/v_descale`` contract has no ``corr`` input.  Q offset needs
+# the modified ``fa3fp8_cuda`` path (per-key corr) or a new corr-enabled kernel.
+#
+# Missing plumbing to mirror NVFP4:
+#   * ``calibrate_k_offset`` + ``[H, 128]`` validation: the legacy kernel
+#     indexes ``offset + h * 128`` and has no real ``[B, H, 128]`` support,
+#   * per-layer cache save/load keyed by attention prefix
+#     (``SGLANG_ROT_FP8_OFFSETS`` / ``SGLANG_ROT_FP8_SAVE_OFFSETS``),
+#   * ``SGLANG_ROT_FP8_CALIB_MODE=offline|online|hybrid`` and
+#     ``SGLANG_ROT_FP8_SENSITIVE_LAYERS`` in the backend,
+#   * CUDA-path and torch-fallback parity for the offset subtraction.
 
 
 # ---------------------------------------------------------------------------
@@ -57,7 +86,7 @@ def _import_prebuilt():
 
 def _jit_build():
     """Compile the vendored kernel once; torch caches it per source hash."""
-    if not _SRC.exists() or os.environ.get("SGLANG_ROT_FP8_DISABLE_JIT") == "1":
+    if not _JIT_SRC.exists() or os.environ.get("SGLANG_ROT_FP8_DISABLE_JIT") == "1":
         return None
     if not torch.cuda.is_available():
         return None
@@ -65,14 +94,14 @@ def _jit_build():
 
     return load(
         name="fp8_head_quant_cuda",
-        sources=[str(_SRC)],
+        sources=[str(_JIT_SRC)],
         extra_cflags=["-O3", "-std=c++17"],
         extra_cuda_cflags=[
             "-O3",
             "-std=c++17",
             "-DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK",
         ],
-        extra_include_paths=[str(_SRC.parent)],
+        extra_include_paths=[str(_JIT_SRC.parent)],
         verbose=False,
     )
 
@@ -139,6 +168,9 @@ def quantize_q_k_v(
     if lib is not None:
         empty = torch.empty(0, device=q.device, dtype=torch.float32)
         q8, sq = lib.preprocess_q_head_fp8_cuda(q, empty)
+        # TODO(yiakwy): the second ``empty`` is the K offset.  Pass the
+        # per-layer calibrated ``mean_{b,s} H64(K)`` once the cache exists; see
+        # the module-level TODO.  Keep the Q offset empty (no FA3 corr path).
         k8, sk, _corr = lib.preprocess_k_head_fp8_cuda(k, empty, empty)
         v8, sv = lib.preprocess_v_head_fp8_cuda_norot(v)
         return (

@@ -532,25 +532,25 @@ class _FlashAttentionBackendResolver(_CudaAttentionBackendResolver):
 class _FP8FlashAttentionSM120BackendResolver(_CudaAttentionBackendResolver):
     backend = AttentionBackendEnum.FP8_FA_SM120
 
-    # CuTe-DSL mma.sync FP8 kernel written for SM120 (GeForce RTX 50 / RTX PRO
-    # Blackwell). Dense non-causal head_dim 128 only; the backend itself falls
-    # back to cuDNN SDPA for other calls.
+    # CuTe-DSL mma.sync FP8 kernel written for SM120 and also assembled for the
+    # SM121 "a" target (GB10). Dense non-causal head_dim 128 only; the backend
+    # itself falls back to cuDNN SDPA for other calls.
     @classmethod
     def resolve(cls, platform) -> str | AttentionBackendEnum:
-        if platform.get_device_capability() != (12, 0):
+        if platform.get_device_capability() not in ((12, 0), (12, 1)):
             logger.warning(
-                "fp8_fa_sm120 attention needs an SM120 device; falling back to cuDNN SDPA."
+                "fp8_fa_sm120 attention needs an SM120/SM121 device; falling back to cuDNN SDPA."
             )
             return AttentionBackendEnum.TORCH_CUDNN_SDPA
         try:
             import cutlass.cute  # noqa: F401
             import triton  # noqa: F401
 
-            from sglang.multimodal_gen.runtime.layers.attention.backends.fp8_fa_sm120_attn import (  # noqa: F401
+            from sglang.multimodal_gen.runtime.layers.attention.backends.rot_fp8_attn_sm120a_ref import (  # noqa: F401
                 FP8FlashAttentionSM120Backend,
             )
 
-            return "sglang.multimodal_gen.runtime.layers.attention.backends.fp8_fa_sm120_attn.FP8FlashAttentionSM120Backend"
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.rot_fp8_attn_sm120a_ref.FP8FlashAttentionSM120Backend"
         except ImportError as error:
             logger.warning(
                 "fp8_fa_sm120 attention backend failed to import (%s); falling back to cuDNN SDPA.",
@@ -585,6 +585,32 @@ class _RotFp8AttentionBackendResolver(_CudaAttentionBackendResolver):
             return AttentionBackendEnum.FA
 
 
+class _RotNvfp4AttentionBackendResolver(_CudaAttentionBackendResolver):
+    backend = AttentionBackendEnum.ROT_NVFP4
+
+    @classmethod
+    def resolve(cls, platform) -> str:
+        capability = platform.get_device_capability()
+        capability_tuple = (
+            (capability.major, capability.minor) if capability is not None else None
+        )
+        if capability_tuple not in ((12, 0), (12, 1)):
+            raise ValueError(
+                "rot_nvfp4 attention needs an SM120/SM121 (Blackwell) device; "
+                f"this device reports {capability.as_version_str() if capability else 'unknown'}."
+            )
+        from sglang.kernels.ops.attention.rot_nvfp4_quant import nvfp4_status
+
+        available, error = nvfp4_status()
+        if not available:
+            raise ValueError(error)
+        from sglang.multimodal_gen.runtime.layers.attention.backends.rot_nvfp4_attn import (  # noqa: F401
+            RotNvfp4AttentionBackend,
+        )
+
+        return "sglang.multimodal_gen.runtime.layers.attention.backends.rot_nvfp4_attn.RotNvfp4AttentionBackend"
+
+
 _CUDA_ATTENTION_BACKEND_RESOLVERS = {
     resolver.backend: resolver
     for resolver in (
@@ -610,6 +636,7 @@ _CUDA_ATTENTION_BACKEND_RESOLVERS = {
         _FlashAttentionBackendResolver,
         _FP8FlashAttentionSM120BackendResolver,
         _RotFp8AttentionBackendResolver,
+        _RotNvfp4AttentionBackendResolver,
     )
 }
 

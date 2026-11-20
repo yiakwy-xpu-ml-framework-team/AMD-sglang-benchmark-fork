@@ -626,6 +626,17 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
 
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        # Mark the request boundary for per-request NVFP4 offset calibration.
+        # This is a counter increment only; the backend decides whether the
+        # layer is online (sensitive) or offline (cached).
+        try:
+            from sglang.kernels.ops.attention.rot_nvfp4_quant import (
+                begin_request,
+            )
+
+            begin_request()
+        except Exception:
+            pass
         with self._offload_for_torch_compile_warmup(batch):
             return self._forward_native(batch, server_args)
 

@@ -53,6 +53,7 @@ class AttentionBackendEnum(enum.Enum):
     CUBE_SPARSE_ATTN = enum.auto()
     FP8_FA_SM120 = enum.auto()
     ROT_FP8 = enum.auto()
+    ROT_NVFP4 = enum.auto()
     NO_ATTENTION = enum.auto()
 
     def __str__(self):

@@ -1,11 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """FP8 attention on SGLang's [S, H, 128] strided BF16 views.
 
-fp8_attention() quantizes Q/K/V per head with the fused Triton passes, runs the CuTe-DSL
-kernel and returns (output [S, H, 128] BF16, lse [H, S] FP32). The compiled kernel is
-cached per (sequence, heads, device); the E4M3, scale, output and LSE buffers come from
-the caching allocator on every call and belong to the caller, nothing is retained
-between calls.
+fp8_attention() optionally applies block-H64 rotation and a calibrated K-only
+offset, quantizes Q/K/V per head with the fused Triton passes, runs the CuTe-DSL
+kernel and returns (output [S, H, 128] BF16, lse [H, S] FP32). The compiled
+kernel is cached per (sequence, heads, device); the E4M3, scale, output and LSE
+buffers come from the caching allocator on every call and belong to the caller,
+nothing is retained between calls.
+
+Only K is offset.  Q would need a per-key ``corr`` epilogue that this kernel
+does not have; see ``offsets.py``.
 """
 
 import logging
@@ -20,6 +24,10 @@ from cutlass.cute.runtime import from_dlpack
 
 from sglang.kernels.ops.attention.fp8_fa_sm120.fused_prep import fused_prepare
 from sglang.kernels.ops.attention.fp8_fa_sm120.kernel import fp8_attention_host
+from sglang.kernels.ops.attention.fp8_fa_sm120.offsets import (
+    rotate_h64,
+    validate_k_offset,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -119,14 +127,58 @@ def _kernel_views(workspace):
     return (mQ, mK, mV, mO, mLSE, mScales)
 
 
-def fp8_attention(q, k, v, softmax_scale=None):
-    """Attention over strided [S, H, 128] BF16 views; returns (output [S, H, 128], lse [H, S])."""
-    return _fp8_attention(q, k, v, softmax_scale, block_scaled_mma=True)
+def fp8_attention(
+    q,
+    k,
+    v,
+    softmax_scale=None,
+    *,
+    k_offset=None,
+    rotate=False,
+):
+    """Attention over strided [S, H, 128] BF16 views.
+
+    With ``rotate=True``, Q/K are rotated by H64 and K is centered by the
+    fp32 ``[H,128]`` ``k_offset`` before quantization.  V is never rotated or
+    offset.  Returns ``(output [S, H, 128], lse [H, S])``.
+    """
+    return _fp8_attention(
+        q,
+        k,
+        v,
+        softmax_scale,
+        block_scaled_mma=True,
+        k_offset=k_offset,
+        rotate=rotate,
+    )
 
 
-def _fp8_attention(q, k, v, softmax_scale, block_scaled_mma):
+def _fp8_attention(
+    q,
+    k,
+    v,
+    softmax_scale,
+    block_scaled_mma,
+    *,
+    k_offset=None,
+    rotate=False,
+):
     # block_scaled_mma is not a user option: the output is bit-equal either way.
     scale = validate_inputs(q, k, v, softmax_scale)
+    if k_offset is not None and not rotate:
+        raise ValueError("k_offset requires rotate=True")
+    if rotate:
+        q = rotate_h64(q)
+        k = rotate_h64(k)
+        if k_offset is not None:
+            k = k - validate_k_offset(
+                k_offset, k.device, heads=k.shape[1]
+            ).to(k.dtype)
+        # fused_prepare assumes Q/K/V share a stride set.  Rotation makes Q/K
+        # contiguous, so materialize V with the same layout.  TODO(yiakwy):
+        # pass per-tensor strides through fused_prepare and drop this copy.
+        v = v.contiguous()
+
     kernel_scale = cutlass.Float32(scale)
     key = (*kernel_key(q), block_scaled_mma)
 

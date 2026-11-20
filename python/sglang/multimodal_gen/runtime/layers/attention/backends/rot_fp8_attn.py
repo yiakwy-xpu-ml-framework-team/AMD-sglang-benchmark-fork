@@ -146,6 +146,13 @@ class RotFp8AttentionImpl(AttentionImpl):
             )
             self._reported = True
 
+    # TODO(yiakwy): Hopper FP8 calibration is not wired here.  ``_run_varlen``
+    # calls ``quantize_q_k_v`` without a K offset, so this is the no-offset
+    # baseline, not the kernel repo's ``fp8_prefill_h64_fa3`` recipe.  Mirror
+    # ``rot_nvfp4_attn`` later: ``_ensure_offsets`` + prefix-keyed cache +
+    # offline/online/hybrid, with ``k_offset = mean_{b,s} H64(K)`` per layer.
+    # Keep Q offset empty: pristine FA3 has no per-key ``corr`` input; Q offset
+    # needs the modified ``fa3fp8_cuda`` path.
 
     def _run_varlen(
         self,
@@ -163,9 +170,11 @@ class RotFp8AttentionImpl(AttentionImpl):
         h = query.shape[1]
         d = query.shape[2]
         t = query.shape[0]
+
         q = query.reshape(1, t, h, d).contiguous()
         k = key.reshape(1, t, h, d).contiguous()
         v = value.reshape(1, t, h, d).contiguous()
+
         q8, sq, k8, sk, v8, sv = quantize_q_k_v(q, k, v)
         output = flash_attn_varlen_func(
             q8.view(t, h, d),

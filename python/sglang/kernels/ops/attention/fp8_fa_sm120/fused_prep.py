@@ -1,6 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Fused FP8 preparation for the SM120 kernel: two Triton passes into the workspace.
 
+This is the vector-quantization half: one ``amax / 448`` scale per head, E4M3.
+It expects whatever Q/K layout the caller passes.  ``plan.fp8_attention``
+applies the optional block-H64 rotation and K centering *before* this prep, so
+this file itself does not rotate or offset anything.  ``rot_nvfp4`` uses a
+different value format (E2M1 + block scales); do not assume shared numerics.
+
 Replaces a Torch chain (FP32 copy, amax, divide, cast,
 padded copy, V transpose copy) with one per-head amax pass and one pack pass that
 writes the kernel's own buffers directly:
@@ -20,6 +26,11 @@ import triton.language as tl
 
 # Power of two >= 16: the V^T key permutation works in groups of 16 tokens.
 BLOCK_TOKENS = 64
+
+# TODO(yiakwy): rotation and K centering currently run in plan.py, which makes
+# Q/K contiguous and forces a V copy to keep one shared stride set.  Fuse H64 +
+# K offset into these passes and give Q/K/V their own strides to remove that
+# copy.  Do not add a Q offset here: it needs a per-key corr epilogue.
 
 
 # Triton's `/` lowers to div.full.f32 (approximate); Torch divides with div.rn.
