@@ -47,16 +47,28 @@ def _load_topk_backend():
     return _IN_TREE or _PIP
 
 
-def fast_sampler_available() -> bool:
-    if os.environ.get("SGLANG_YUE2_FAST_SAMPLER", "1") != "1":
-        return False
+def deepselect_runnable() -> bool:
+    """True when the loaded top-k backend can run on the current device.
+
+    DeepSelect JIT builds only for SM 9.0/10.0/10.3. Add ROCm safty check.
+    """
     backend = _load_topk_backend()
     if not backend:
         return False
+    
+    is_deepselect_supported = getattr(backend, "is_deepselect_supported", None)
     try:
-        return torch.cuda.is_available()
+        if is_deepselect_supported is None:
+            return torch.version.hip is None and torch.cuda.is_available()
+        return bool(is_deepselect_supported())
     except Exception:
         return False
+
+
+def fast_sampler_available() -> bool:
+    if os.environ.get("SGLANG_YUE2_FAST_SAMPLER", "1") != "1":
+        return False
+    return deepselect_runnable()
 
 
 STRIDE_FLOATS = 256  # DeepSelect row alignment: 1024B = 256 fp32
