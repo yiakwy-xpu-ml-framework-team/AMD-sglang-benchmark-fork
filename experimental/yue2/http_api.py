@@ -21,6 +21,7 @@ from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.configs.sample.sampling_params import generate_request_id
 from sglang.srt.observability.trace import extract_trace_headers
+from sglang.srt.models.yue2.protocol import SongRequest
 
 
 router = APIRouter(prefix="/v1/audio", tags=["audio"])
@@ -46,6 +47,38 @@ class Yue2AudioGenerationsRequest(BaseModel):
         None, description="export plan/semantic/latent/request/config artifacts here")
 
 
+def _validate_song_request(request: "Yue2AudioGenerationsRequest",
+                           request_id: str) -> str:
+    """Return a filename-safe song id or raise HTTP 400.
+
+    The scheduler builds ``SongRequest`` inside a worker; validation errors
+    there surface as an opaque HTTP 500.  Validate at the edge instead so a
+    malformed ABC/empty output name is a 400 with an actionable message.
+    """
+    if request.abc is not None and not request.abc.strip():
+        raise HTTPException(
+            400,
+            "abc was provided but is empty; omit it (null) for a full song, "
+            "or send non-empty ABC text for cot=melody/full",
+        )
+    if request.abc is not None and request.cot == "off":
+        raise HTTPException(400, "abc cannot be combined with cot=off")
+    song_id = request.output_file_name or request_id
+    try:
+        SongRequest(
+            style=request.style,
+            lyrics=request.lyrics,
+            cot=request.cot,
+            seed=request.seed,
+            abc=request.abc,
+            cfg_scale=request.cfg_scale,
+            id=song_id,
+        )
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return song_id
+
+
 @router.post("/generations")
 @router.post("/music/generations")
 async def generate_audio(
@@ -54,6 +87,7 @@ async def generate_audio(
 ):
     server_args = get_global_server_args()
     request_id = generate_request_id()
+    song_id = _validate_song_request(request, request_id)
     prompt_payload = {
         "style": request.style,
         "lyrics": request.lyrics,
@@ -61,7 +95,7 @@ async def generate_audio(
         "seed": request.seed,
         "abc": request.abc,
         "cfg_scale": request.cfg_scale,
-        "id": request.output_file_name or request_id,
+        "id": song_id,
     }
     if request.artifacts_dir:
         prompt_payload["artifacts_dir"] = request.artifacts_dir
