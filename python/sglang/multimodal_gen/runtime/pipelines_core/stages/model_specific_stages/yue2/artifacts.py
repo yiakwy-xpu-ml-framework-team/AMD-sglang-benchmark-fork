@@ -2,6 +2,8 @@
 """Optional per-request artifact export pipeline stage."""
 from __future__ import annotations
 
+import time
+
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -21,21 +23,22 @@ class Yue2ArtifactExportStage(PipelineStage):
     """
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        started = time.perf_counter()
         artifacts_dir = batch.extra.get("yue2_artifacts_dir") or ""
-        if not artifacts_dir:
-            return batch
-        request: SongRequest = batch.extra["yue2_request"]
-        export_song_artifacts(
-            artifacts_dir,
-            request=request,
-            latents=batch.extra["yue2_latents"],
-            semantic_ids=[
-                int(token) - CODEC_OFFSET
-                for token in batch.extra["yue2_semantic_ids"]
-            ],
-            prefix_ids=[int(token) for token in batch.extra["yue2_semantic_prefix"]],
-            abc_ids=[int(token) for token in batch.extra.get("yue2_abc_ids") or []],
-            timing=batch.extra.get("yue2_timing") or {},
-            truncated=bool(batch.extra.get("yue2_truncated")),
-        )
+        if artifacts_dir:
+            request: SongRequest = batch.extra["yue2_request"]
+            export_song_artifacts(
+                artifacts_dir,
+                request=request,
+                latents=batch.extra["yue2_latents"],
+                semantic_ids=[
+                    int(token) - CODEC_OFFSET
+                    for token in batch.extra["yue2_semantic_ids"]
+                ],
+                prefix_ids=[int(token) for token in batch.extra["yue2_semantic_prefix"]],
+                abc_ids=[int(token) for token in batch.extra.get("yue2_abc_ids") or []],
+                timing=batch.extra.get("yue2_timing") or {},
+                truncated=bool(batch.extra.get("yue2_truncated")),
+            )
+        batch.extra["yue2_artifact_seconds"] = time.perf_counter() - started
         return batch

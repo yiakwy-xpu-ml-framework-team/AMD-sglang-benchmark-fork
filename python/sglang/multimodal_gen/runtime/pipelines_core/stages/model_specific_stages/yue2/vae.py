@@ -61,12 +61,25 @@ class Yue2VAEDecodeStage(PipelineStage):
                 "yue2_audio_seconds": audio.shape[-1] / sample_rate,
             }
         )
+        timing_keys = (
+            "yue2_prepare_seconds",
+            "yue2_timing",
+            "yue2_artifact_seconds",
+            "yue2_nar_seconds",
+            "yue2_vae_seconds",
+            "yue2_audio_seconds",
+            "yue2_nar_fast",
+        )
+        diagnostics = {
+            key: batch.extra[key] for key in timing_keys if key in batch.extra
+        }
         return OutputBatch(
             output=None,
             audio=audio,
             audio_sample_rate=sample_rate,
             output_file_paths=[output_path] if batch.save_output else None,
             metrics=batch.metrics,
+            extra=diagnostics or None,
         )
 
     def _decode(self, latents: torch.Tensor, core: int, halo: int) -> torch.Tensor:
