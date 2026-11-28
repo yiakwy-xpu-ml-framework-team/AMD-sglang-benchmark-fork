@@ -84,11 +84,11 @@ jq -n \
     --argjson abc "$ABC_JSON" --argjson seed "${SEED:-831001}" \
     --argjson sem "$SEM" --argjson abct "$ABCT" \
     --argjson frames "$FRAMES" --argjson steps "$STEPS" \
-    --arg out "$OUT" --arg fname "${TASK}.wav" \
+    --arg fname "${TASK}.wav" \
     '{style:$style, lyrics:$lyrics, cot:$cot, abc:$abc, seed:$seed,
       ode_steps:$steps, semantic_max_tokens:$sem, abc_max_tokens:$abct,
       vae_core_frames:$frames, vae_halo_frames:16,
-      output_path:$out, output_file_name:$fname}' > "$PAYLOAD"
+      output_file_name:$fname}' > "$PAYLOAD"
 
 echo "POST $SERVER/v1/audio/generations  task=$TASK  cot=$COT  semantic=$SEM  abc=$ABCT  frames=$FRAMES"
 META="$OUT/${TASK}_meta.txt"
@@ -107,9 +107,34 @@ if [[ "$HTTP_CODE" -ge 400 ]]; then
     exit 1
 fi
 
-jq -r '{inference_time_s, sample_rate, audio_len:(.audio|length)}' \
+jq -r '{inference_time_s,
+        request_wall_seconds:.timings.request_wall_seconds,
+        overhead_seconds:.timings.overhead_seconds,
+        stages:.timings.stages,
+        yue2:.timings.yue2,
+        sample_rate, audio_filename}' \
     "$OUT/${TASK}_resp.json" 2>/dev/null || cat "$OUT/${TASK}_resp.json"
+
+# The server returns a server-side path in `audio`; use `audio_url` and
+# download the WAV to this machine.  Older servers may omit audio_url, in
+# which case fall back to the request-id content route.
+SERVER_BASE="${SERVER%/}"
+REQUEST_ID="$(jq -r '.id // empty' "$OUT/${TASK}_resp.json")"
+AUDIO_URL="$(jq -r '.audio_url // empty' "$OUT/${TASK}_resp.json")"
+if [[ -z "$AUDIO_URL" && -n "$REQUEST_ID" ]]; then
+    AUDIO_URL="/v1/audio/generations/${REQUEST_ID}/content"
+fi
+if [[ -z "$AUDIO_URL" ]]; then
+    echo "ERROR: server returned no audio_url for $TASK" >&2
+    echo "The remote server must run the audio download route." >&2
+    exit 1
+fi
+
+echo "GET ${SERVER_BASE}${AUDIO_URL}"
+curl -fL --max-time 300 "${SERVER_BASE}${AUDIO_URL}" \
+    -o "$OUT/${TASK}.wav"
+
 echo "response : $OUT/${TASK}_resp.json"
 echo "payload  : $PAYLOAD"
 echo "wav      : $OUT/${TASK}.wav"
-ls -lh "$OUT/${TASK}.wav" 2>/dev/null || true
+ls -lh "$OUT/${TASK}.wav"

@@ -505,6 +505,8 @@ class OutputBatch:
     noise_pred: torch.Tensor | list | tuple | None = None
     peak_memory_mb: float = 0.0
     usage: dict[str, Any] | None = None
+    # Model-specific timing/diagnostics (JSON-serializable).
+    extra: dict[str, Any] | None = None
 
     def drop_payload_for_warmup(self) -> None:
         self.output = None
@@ -516,3 +518,4 @@ class OutputBatch:
         self.output_file_paths = None
         self.raw_frame_batches = None
         self.noise_pred = None
+        self.extra = None

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import asdict, dataclass
 
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -83,6 +84,7 @@ class Yue2PrepareRequestStage(PipelineStage):
         self.tokenizer = tokenizer
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        started = time.perf_counter()
         request = Yue2Request.from_sampling_params(batch.sampling_params)
         song_request = request.to_song_request()
         from sglang.srt.models.yue2.protocol import token_prefixes
@@ -96,6 +98,7 @@ class Yue2PrepareRequestStage(PipelineStage):
                 "yue2_prefix": list(prefix),
                 "yue2_request_id": song_request.id,
                 "yue2_artifacts_dir": request.artifacts_dir,
+                "yue2_prepare_seconds": time.perf_counter() - started,
             }
         )
         return batch
